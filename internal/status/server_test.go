@@ -1,6 +1,7 @@
 package status
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"yandex-bridge/internal/auth"
 	"yandex-bridge/internal/bridge"
@@ -180,6 +182,54 @@ func TestDevicesEndpointCarriesWhatConfigNeeds(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body is missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// TestResponsesAreDeclaredUTF8 guards against mojibake in anything that reads
+// the endpoint.
+//
+// Go emits UTF-8 and never transcodes, but "application/json" with no charset
+// leaves the decision to the client, and a tool falling back to the system
+// codepage renders Cyrillic as the classic "Р”РµРґ" soup. Saying utf-8 out loud
+// costs nothing and removes the ambiguity.
+func TestResponsesAreDeclaredUTF8(t *testing.T) {
+	const name = "Дед Максим"
+
+	cases := map[string]func(*Server, http.ResponseWriter, *http.Request){
+		"/healthz": (*Server).handleHealth,
+		"/devices": (*Server).handleDevices,
+	}
+
+	for path, handler := range cases {
+		t.Run(path, func(t *testing.T) {
+			s := newServerWithInventory([]bridge.MappingReport{{
+				DeviceID: "d", Name: name, Type: "devices.types.smart_speaker",
+				Room: "Гостиная", Skipped: true, Reason: "unsupported",
+			}})
+
+			rec := httptest.NewRecorder()
+			handler(s, rec, httptest.NewRequest(http.MethodGet, path, nil))
+
+			if ct := rec.Header().Get("Content-Type"); !strings.Contains(strings.ToLower(ct), "charset=utf-8") {
+				t.Errorf("Content-Type = %q, want it to declare charset=utf-8", ct)
+			}
+			if !utf8.Valid(rec.Body.Bytes()) {
+				t.Error("response body is not valid UTF-8")
+			}
+		})
+	}
+
+	// And the bytes really are UTF-8 rather than something already mangled:
+	// "Д" must be D0 94, not the CP1251 pair that mojibake would produce.
+	s := newServerWithInventory([]bridge.MappingReport{{DeviceID: "d", Name: name}})
+	rec := httptest.NewRecorder()
+	s.handleDevices(rec, httptest.NewRequest(http.MethodGet, "/devices", nil))
+
+	if !bytes.Contains(rec.Body.Bytes(), []byte(name)) {
+		t.Errorf("body does not contain the name as UTF-8 bytes:\n%q", rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("Р”РµРґ")) {
+		t.Error("the bridge itself produced mojibake")
 	}
 }
 

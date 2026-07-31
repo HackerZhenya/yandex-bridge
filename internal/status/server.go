@@ -144,7 +144,10 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		Devices []bridge.MappingReport `json:"devices"`
 	}{Count: len(reports), Devices: reports}
 
-	w.Header().Set("Content-Type", "application/json")
+	// Device and room names are Cyrillic. JSON is UTF-8 by definition, but a
+	// client left to guess may fall back to the system codepage and render
+	// them as mojibake, so the encoding is stated explicitly.
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if reports == nil {
 		// Nothing polled yet: an empty list would look like an empty account.
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -196,7 +199,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		code = http.StatusServiceUnavailable
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	// Device and room names are Cyrillic. JSON is UTF-8 by definition, but a
+	// client left to guess may fall back to the system codepage and render
+	// them as mojibake, so the encoding is stated explicitly.
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
