@@ -76,6 +76,34 @@ const (
 	waterLevelProp = `{"type":"devices.properties.float","retrievable":true,
 	                   "parameters":{"instance":"water_level","unit":"unit.percent"},
 	                   "state":{"instance":"water_level","value":70}}`
+
+	motionEvent = `{"type":"devices.properties.event","retrievable":true,
+	                "parameters":{"instance":"motion","events":[{"value":"detected"}]},
+	                "state":{"instance":"motion","value":"detected"}}`
+
+	openEvent = `{"type":"devices.properties.event","retrievable":true,
+	              "parameters":{"instance":"open","events":[{"value":"opened"}]},
+	              "state":{"instance":"open","value":"opened"}}`
+
+	leakEvent = `{"type":"devices.properties.event","retrievable":true,
+	              "parameters":{"instance":"water_leak","events":[{"value":"leak"}]},
+	              "state":{"instance":"water_leak","value":"leak"}}`
+
+	smokeHighEvent = `{"type":"devices.properties.event","retrievable":true,
+	                   "parameters":{"instance":"smoke","events":[{"value":"high"}]},
+	                   "state":{"instance":"smoke","value":"high"}}`
+
+	batteryEvent = `{"type":"devices.properties.event","retrievable":true,
+	                 "parameters":{"instance":"battery_level","events":[{"value":"low"}]},
+	                 "state":{"instance":"battery_level","value":"low"}}`
+
+	voiceActivityEvent = `{"type":"devices.properties.event","retrievable":true,
+	                       "parameters":{"instance":"voice_activity"},
+	                       "state":{"instance":"voice_activity","value":"speech"}}`
+
+	vibrationEvent = `{"type":"devices.properties.event","retrievable":true,
+	                   "parameters":{"instance":"vibration"},
+	                   "state":{"instance":"vibration","value":"tilt"}}`
 )
 
 // kettleJSON is the device this whole feature exists for.
@@ -406,6 +434,113 @@ func TestExcludedDeviceStillListsItsFeatures(t *testing.T) {
 	// Knowing what an excluded device offers is how you decide to un-exclude it.
 	if len(report.Unmapped) == 0 {
 		t.Error("an excluded device reported nothing about its capabilities")
+	}
+}
+
+func TestEventSensorsAreMapped(t *testing.T) {
+	tests := []struct {
+		name  string
+		event string
+		want  SensorKind
+	}{
+		{"motion", motionEvent, SensorMotion},
+		{"open", openEvent, SensorContact},
+		{"water leak", leakEvent, SensorLeak},
+		{"smoke", smokeHighEvent, SensorSmoke},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec, _, ok := buildSpec(t,
+				`{"id":"d","name":"Датчик","type":"devices.types.sensor","properties":[`+tt.event+`]}`,
+				config.DeviceOverride{})
+			if !ok {
+				t.Fatal("BuildSpec returned false")
+			}
+			if spec.Kind != KindSensor {
+				t.Errorf("Kind = %q, want sensor", spec.Kind)
+			}
+			if !spec.HasSensor(tt.want) {
+				t.Errorf("sensors = %v, want %q", spec.Sensors, tt.want)
+			}
+		})
+	}
+}
+
+// TestSpeakerWithMotionBecomesASensor is the case that prompted this: a Yandex
+// speaker reports no on_off at all, so it used to be skipped outright — but it
+// carries a motion event that HomeKit understands perfectly well.
+func TestSpeakerWithMotionBecomesASensor(t *testing.T) {
+	spec, report, ok := buildSpec(t,
+		`{"id":"speaker","name":"Малинка","type":"devices.types.smart_speaker.yandex.station.cucumber",
+		  "capabilities":[{"type":"devices.capabilities.color_setting",
+		                   "parameters":{"color_model":"hsv"}}],
+		  "properties":[`+motionEvent+`,`+voiceActivityEvent+`]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatalf("speaker was skipped: %s", report.Reason)
+	}
+	if spec.Kind != KindSensor {
+		t.Errorf("Kind = %q, want sensor", spec.Kind)
+	}
+	if !spec.HasSensor(SensorMotion) {
+		t.Errorf("sensors = %v, want motion", spec.Sensors)
+	}
+	// Undocumented speaker extras stay unmapped rather than being guessed at.
+	if !strings.Contains(strings.Join(report.Unmapped, " "), "voice_activity") {
+		t.Errorf("unmapped = %v, want voice_activity listed", report.Unmapped)
+	}
+}
+
+func TestBatteryEventCountsAsABattery(t *testing.T) {
+	spec, _, ok := buildSpec(t,
+		`{"id":"d","name":"Датчик","type":"devices.types.sensor","properties":[`+motionEvent+`,`+batteryEvent+`]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	// A device reporting low/normal instead of a percentage still deserves
+	// HomeKit's low-battery warning.
+	if !spec.HasSensor(SensorBattery) {
+		t.Errorf("sensors = %v, want battery", spec.Sensors)
+	}
+}
+
+func TestBatteryIsNotDuplicated(t *testing.T) {
+	spec, _, ok := buildSpec(t,
+		`{"id":"d","name":"Датчик","type":"devices.types.sensor",
+		  "properties":[`+batteryProp+`,`+batteryEvent+`]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	count := 0
+	for _, s := range spec.Sensors {
+		if s == SensorBattery {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("battery appears %d times, want once", count)
+	}
+}
+
+// TestPulseEventsStayUnmapped guards against inventing a state where there is
+// none: vibration is a momentary pulse, and a motion sensor stuck at "detected"
+// forever would be worse than no sensor.
+func TestPulseEventsStayUnmapped(t *testing.T) {
+	spec, report, ok := buildSpec(t,
+		`{"id":"d","name":"Датчик","type":"devices.types.sensor",
+		  "properties":[`+motionEvent+`,`+vibrationEvent+`]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	if len(spec.Sensors) != 1 || spec.Sensors[0] != SensorMotion {
+		t.Errorf("sensors = %v, want motion only", spec.Sensors)
+	}
+	if !strings.Contains(strings.Join(report.Unmapped, " "), "vibration") {
+		t.Errorf("unmapped = %v, want vibration listed", report.Unmapped)
 	}
 }
 

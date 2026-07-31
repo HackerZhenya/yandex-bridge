@@ -76,6 +76,12 @@ type Accessory struct {
 	battery     *service.BatteryService
 	toggles     map[string]*characteristic.On
 
+	motion  *characteristic.MotionDetected
+	contact *characteristic.ContactSensorState
+	leak    *characteristic.LeakDetected
+	smoke   *characteristic.SmokeDetected
+	gas     *characteristic.CarbonMonoxideDetected
+
 	// offline mirrors the device's own state as reported by Yandex, which is
 	// separate from whether the bridge can reach Yandex at all.
 	offline atomic.Bool
@@ -263,33 +269,71 @@ func (a *Accessory) buildThermostat() *service.S {
 
 // wirePrimaryHandlers connects the writable characteristics to the coalescing
 // buffer and the readable ones to the reachability guard.
+//
+// Each setter records what the user asked for *before* the write is even sent.
+// Protecting the value only once Yandex confirms would leave it exposed for the
+// coalescing delay plus a round trip — close to a second — and a poll landing
+// in that window puts the old value straight back, which is exactly what makes
+// a dial jump under the user's finger.
 func (a *Accessory) wirePrimaryHandlers() {
 	if a.on != nil {
-		a.on.OnSetRemoteValue(func(bool) error { a.queueWrite(writeOnOff); return nil })
+		a.on.OnSetRemoteValue(func(v bool) error {
+			a.expectValue(a.on.C, v)
+			a.queueWrite(writeOnOff)
+			return nil
+		})
 		a.on.ValueRequestFunc = a.readGuard(func() any { return a.on.Value() })
 	}
 	if a.brightness != nil {
-		a.brightness.OnSetRemoteValue(func(int) error { a.queueWrite(writeBrightness); return nil })
+		a.brightness.OnSetRemoteValue(func(v int) error {
+			a.expectValue(a.brightness.C, v)
+			a.queueWrite(writeBrightness)
+			return nil
+		})
 		a.brightness.ValueRequestFunc = a.readGuard(func() any { return a.brightness.Value() })
 	}
 	if a.hue != nil {
-		a.hue.OnSetRemoteValue(func(float64) error { a.queueWrite(writeColor); return nil })
+		a.hue.OnSetRemoteValue(func(v float64) error {
+			a.expectValue(a.hue.C, v)
+			a.queueWrite(writeColor)
+			return nil
+		})
 		a.hue.ValueRequestFunc = a.readGuard(func() any { return a.hue.Value() })
 	}
 	if a.saturation != nil {
-		a.saturation.OnSetRemoteValue(func(float64) error { a.queueWrite(writeColor); return nil })
+		a.saturation.OnSetRemoteValue(func(v float64) error {
+			a.expectValue(a.saturation.C, v)
+			a.queueWrite(writeColor)
+			return nil
+		})
 		a.saturation.ValueRequestFunc = a.readGuard(func() any { return a.saturation.Value() })
 	}
 	if a.colorTemp != nil {
-		a.colorTemp.OnSetRemoteValue(func(int) error { a.queueWrite(writeColor); return nil })
+		a.colorTemp.OnSetRemoteValue(func(v int) error {
+			a.expectValue(a.colorTemp.C, v)
+			a.queueWrite(writeColor)
+			return nil
+		})
 		a.colorTemp.ValueRequestFunc = a.readGuard(func() any { return a.colorTemp.Value() })
 	}
 	if a.targetState != nil {
-		a.targetState.OnSetRemoteValue(func(int) error { a.queueWrite(writeOnOff); return nil })
+		a.targetState.OnSetRemoteValue(func(v int) error {
+			a.expectValue(a.targetState.C, v)
+			// CurrentHeatingCoolingState is read-only and mirrors the target.
+			// Leaving it to the next poll made the tile read "off" and
+			// "heating" at the same time for several seconds.
+			_ = a.currentHeat.SetValue(v)
+			a.queueWrite(writeOnOff)
+			return nil
+		})
 		a.targetState.ValueRequestFunc = a.readGuard(func() any { return a.targetState.Value() })
 	}
 	if a.targetTemp != nil {
-		a.targetTemp.OnSetRemoteValue(func(float64) error { a.queueWrite(writeTarget); return nil })
+		a.targetTemp.OnSetRemoteValue(func(v float64) error {
+			a.expectValue(a.targetTemp.C, v)
+			a.queueWrite(writeTarget)
+			return nil
+		})
 		a.targetTemp.ValueRequestFunc = a.readGuard(func() any { return a.targetTemp.Value() })
 	}
 	if a.currentTemp != nil {
@@ -324,6 +368,41 @@ func (a *Accessory) addSensorServices() {
 		a.battery = s
 		a.A.AddS(s.S)
 	}
+
+	// Event-driven sensors. Added after the numeric ones so the service order
+	// stays deterministic, which is what keeps hap's instance ids stable.
+	if a.Spec.HasSensor(SensorMotion) {
+		s := service.NewMotionSensor()
+		a.motion = s.MotionDetected
+		a.motion.ValueRequestFunc = a.readGuard(func() any { return a.motion.Value() })
+		a.A.AddS(s.S)
+	}
+	if a.Spec.HasSensor(SensorContact) {
+		s := service.NewContactSensor()
+		a.contact = s.ContactSensorState
+		a.contact.ValueRequestFunc = a.readGuard(func() any { return a.contact.Value() })
+		a.A.AddS(s.S)
+	}
+	if a.Spec.HasSensor(SensorLeak) {
+		s := service.NewLeakSensor()
+		a.leak = s.LeakDetected
+		a.leak.ValueRequestFunc = a.readGuard(func() any { return a.leak.Value() })
+		a.A.AddS(s.S)
+	}
+	if a.Spec.HasSensor(SensorSmoke) {
+		s := service.NewSmokeSensor()
+		a.smoke = s.SmokeDetected
+		a.smoke.ValueRequestFunc = a.readGuard(func() any { return a.smoke.Value() })
+		a.A.AddS(s.S)
+	}
+	if a.Spec.HasSensor(SensorGas) {
+		// HomeKit has no "gas" sensor; carbon monoxide is the closest thing
+		// that produces a real alert rather than an anonymous switch.
+		s := service.NewCarbonMonoxideSensor()
+		a.gas = s.CarbonMonoxideDetected
+		a.gas.ValueRequestFunc = a.readGuard(func() any { return a.gas.Value() })
+		a.A.AddS(s.S)
+	}
 }
 
 // addToggleServices exposes each toggle capability as its own switch inside
@@ -341,7 +420,11 @@ func (a *Accessory) addToggleServices() {
 		s.AddC(name.C)
 
 		instance := t.Instance
-		s.On.OnSetRemoteValue(func(bool) error { a.queueWrite(writeTogglePfx + instance); return nil })
+		s.On.OnSetRemoteValue(func(v bool) error {
+			a.expectValue(s.On.C, v)
+			a.queueWrite(writeTogglePfx + instance)
+			return nil
+		})
 		s.On.ValueRequestFunc = a.readGuard(func() any { return s.On.Value() })
 
 		a.toggles[instance] = s.On
@@ -558,8 +641,22 @@ func (a *Accessory) buildActions(dirty map[string]struct{}) ([]yandex.Action, []
 
 // --- echo suppression ---
 
-// recordExpectations remembers what was just written, so that state polled
-// before Yandex catches up does not overwrite it.
+// expectValue protects a single characteristic at the moment HomeKit writes it.
+//
+// The value is passed in rather than read back because hap commits the new
+// value only after the setter returns, so reading it here would record the one
+// being replaced.
+func (a *Accessory) expectValue(c *characteristic.C, value any) {
+	if a.settleWindow <= 0 {
+		return
+	}
+	a.expectMu.Lock()
+	defer a.expectMu.Unlock()
+	a.expect[c] = expectation{value: value, until: time.Now().Add(a.settleWindow)}
+}
+
+// recordExpectations refreshes the deadline once a write has been accepted, so
+// the settle window is measured from the moment Yandex actually took the value.
 func (a *Accessory) recordExpectations(cs []*characteristic.C) {
 	if a.settleWindow <= 0 {
 		return
@@ -677,10 +774,15 @@ func (a *Accessory) applyOnOff(dev yandex.Device) {
 		if on {
 			state = heatingStateHeat
 		}
-		if !a.suppressed(a.targetState.C, state) && state != a.targetState.Value() {
+		// Both characteristics move together or not at all. Updating the
+		// current mode while the target is still protected would show the
+		// kettle as off and heating at the same time.
+		if a.suppressed(a.targetState.C, state) {
+			return
+		}
+		if state != a.targetState.Value() {
 			_ = a.targetState.SetValue(state)
 		}
-		// CurrentHeatingCoolingState is read-only, so it simply follows.
 		if state != a.currentHeat.Value() {
 			_ = a.currentHeat.SetValue(state)
 		}
@@ -796,22 +898,113 @@ func (a *Accessory) applySensors(dev yandex.Device) {
 		}
 	}
 	if a.battery != nil {
-		if p, ok := dev.FloatProperty(yandex.FloatBatteryLevel); ok {
-			if v, err := p.FloatState(); err == nil {
-				level := clampInt(int(math.Round(v)), 0, 100)
-				if level != a.battery.BatteryLevel.Value() {
-					_ = a.battery.BatteryLevel.SetValue(level)
-				}
-				low := 0
-				if level <= 20 {
-					low = 1
-				}
-				if low != a.battery.StatusLowBattery.Value() {
-					_ = a.battery.StatusLowBattery.SetValue(low)
-				}
+		a.applyBattery(dev)
+	}
+	a.applyEventSensors(dev)
+}
+
+func (a *Accessory) applyBattery(dev yandex.Device) {
+	if p, ok := dev.FloatProperty(yandex.FloatBatteryLevel); ok {
+		if v, err := p.FloatState(); err == nil {
+			level := clampInt(int(math.Round(v)), 0, 100)
+			if level != a.battery.BatteryLevel.Value() {
+				_ = a.battery.BatteryLevel.SetValue(level)
+			}
+			low := 0
+			if level <= 20 {
+				low = 1
+			}
+			if low != a.battery.StatusLowBattery.Value() {
+				_ = a.battery.StatusLowBattery.SetValue(low)
+			}
+			return
+		}
+	}
+
+	// Some devices report only "low" or "normal" rather than a percentage.
+	if p, ok := dev.EventProperty(yandex.EventBatteryLevel); ok {
+		if v, err := p.EventState(); err == nil {
+			low := 0
+			if v == yandex.EventValueLow {
+				low = 1
+			}
+			if low != a.battery.StatusLowBattery.Value() {
+				_ = a.battery.StatusLowBattery.SetValue(low)
 			}
 		}
 	}
+}
+
+// applyEventSensors pushes event-driven readings into their characteristics.
+//
+// Yandex event values persist until the next event, so a poll always sees the
+// current state — never a missed pulse, only a late one.
+func (a *Accessory) applyEventSensors(dev yandex.Device) {
+	if a.motion != nil {
+		if v, ok := eventValue(dev, yandex.EventMotion); ok {
+			detected := v == yandex.EventValueDetected
+			if detected != a.motion.Value() {
+				a.motion.SetValue(detected)
+			}
+		}
+	}
+	if a.contact != nil {
+		if v, ok := eventValue(dev, yandex.EventOpen); ok {
+			// HomeKit inverts the wording: 0 is "contact detected", i.e. shut.
+			state := contactDetected
+			if v == yandex.EventValueOpened {
+				state = contactNotDetected
+			}
+			if state != a.contact.Value() {
+				_ = a.contact.SetValue(state)
+			}
+		}
+	}
+	if a.leak != nil {
+		if v, ok := eventValue(dev, yandex.EventWaterLeak); ok {
+			a.setAlarm(a.leak.Int, v == yandex.EventValueLeak)
+		}
+	}
+	if a.smoke != nil {
+		if v, ok := eventValue(dev, yandex.EventSmoke); ok {
+			a.setAlarm(a.smoke.Int, isDetected(v))
+		}
+	}
+	if a.gas != nil {
+		if v, ok := eventValue(dev, yandex.EventGas); ok {
+			a.setAlarm(a.gas.Int, isDetected(v))
+		}
+	}
+}
+
+// setAlarm writes a HomeKit "detected" flag, which is 1 for an alarm.
+func (a *Accessory) setAlarm(c *characteristic.Int, alarm bool) {
+	value := 0
+	if alarm {
+		value = 1
+	}
+	if value != c.Value() {
+		_ = c.SetValue(value)
+	}
+}
+
+// isDetected treats an elevated reading as detection: "high" means the sensor
+// is more sure, not less.
+func isDetected(v string) bool {
+	return v == yandex.EventValueDetected || v == yandex.EventValueHigh
+}
+
+// eventValue reads an event property's current value.
+func eventValue(dev yandex.Device, instance string) (string, bool) {
+	p, ok := dev.EventProperty(instance)
+	if !ok {
+		return "", false
+	}
+	v, err := p.EventState()
+	if err != nil {
+		return "", false
+	}
+	return v, true
 }
 
 // SetUnreachable marks the accessory as not responding, used when Yandex as a

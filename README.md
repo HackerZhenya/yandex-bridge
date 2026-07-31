@@ -181,9 +181,26 @@ TTL = 1. Эти пакеты **не проходят через NAT docker-се�
 | `devices.types.socket` | Outlet |
 | `devices.types.switch` (+ `switch.relay`) | Switch |
 | `cooking.*` и `thermostat` c `on_off` + `range:temperature` | Thermostat: Off/Heat, целевая и текущая температура |
-| `devices.types.sensor.climate` и любое устройство со свойствами | TemperatureSensor / HumiditySensor / BatteryService |
+| `float:temperature` / `humidity` / `battery_level` | TemperatureSensor / HumiditySensor / BatteryService |
+| `event:motion` | MotionSensor |
+| `event:open` | ContactSensor |
+| `event:water_leak` | LeakSensor |
+| `event:smoke` | SmokeSensor |
+| `event:gas` | CarbonMonoxideSensor (ближайший аналог в HomeKit) |
+| `event:battery_level` (low/normal) | StatusLowBattery |
 | `devices.capabilities.toggle` (keep_warm, подсветка, …) | Switch с понятным именем |
 | неизвестный тип, но есть `on_off` | Switch |
+
+**Про задержку событий.** Свойства `event` у Яндекса — это состояния, а не
+импульсы: значение держится до следующего события. Поэтому опрос ничего не
+теряет, но узнаёт с опозданием до `poll_interval` (по умолчанию 15 с). Для
+уведомлений и неспешных сценариев нормально, для «включить свет по движению» —
+нет; уменьшайте `poll_interval`, если нужно быстрее.
+
+Не маппятся осознанно: `event:vibration` (импульс, а не состояние — датчик,
+навсегда застрявший в «сработал», хуже отсутствующего), `event:water_level`, а
+также `voice_activity` и `noise` — недокументированные свойства колонок Яндекса
+без аналога в HomeKit.
 
 **Всё это лежит в одном аксессуаре.** Приложение Дом по умолчанию сводит сервисы
 одного аксессуара в **одну плитку**, а разбить их на отдельные можно самому в

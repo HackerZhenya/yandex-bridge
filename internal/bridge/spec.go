@@ -47,7 +47,30 @@ const (
 	SensorTemperature SensorKind = "temperature"
 	SensorHumidity    SensorKind = "humidity"
 	SensorBattery     SensorKind = "battery"
+
+	// Event-driven readings. Yandex reports these as devices.properties.event
+	// whose value persists until the next event, so polling sees every state —
+	// just up to one poll interval late.
+	SensorMotion  SensorKind = "motion"
+	SensorContact SensorKind = "contact"
+	SensorLeak    SensorKind = "leak"
+	SensorSmoke   SensorKind = "smoke"
+	SensorGas     SensorKind = "gas"
 )
+
+// eventSensors maps a Yandex event instance onto the HomeKit sensor service
+// that means the same thing.
+//
+// Instances left out have no honest HomeKit equivalent: vibration is a pulse
+// rather than a state, water_level has no matching characteristic, and
+// voice_activity and noise are undocumented extras on Yandex speakers.
+var eventSensors = map[string]SensorKind{
+	yandex.EventMotion:    SensorMotion,
+	yandex.EventOpen:      SensorContact,
+	yandex.EventWaterLeak: SensorLeak,
+	yandex.EventSmoke:     SensorSmoke,
+	yandex.EventGas:       SensorGas,
+}
 
 // BrightnessRange is a device's accepted brightness span.
 type BrightnessRange struct {
@@ -434,6 +457,20 @@ func sensorsFor(dev yandex.Device, kind Kind) []SensorKind {
 	if _, ok := dev.FloatProperty(yandex.FloatBatteryLevel); ok {
 		out = append(out, SensorBattery)
 	}
+	// A device may report its battery as an event (low/normal) instead of a
+	// percentage; HomeKit's BatteryService covers both.
+	if _, ok := dev.EventProperty(yandex.EventBatteryLevel); ok && !slices.Contains(out, SensorBattery) {
+		out = append(out, SensorBattery)
+	}
+
+	for _, p := range dev.Properties {
+		if p.Type != yandex.PropertyEvent {
+			continue
+		}
+		if kind, ok := eventSensors[p.Instance()]; ok && !slices.Contains(out, kind) {
+			out = append(out, kind)
+		}
+	}
 	return out
 }
 
@@ -500,7 +537,16 @@ func describeMapping(dev yandex.Device, spec Spec) (mapped, unmapped []string) {
 			case ColorTemperature:
 				mapped = append(mapped, "color_setting → ColorTemperature")
 			default:
-				unmapped = append(unmapped, "color_setting")
+				// Say what it offers: a device can expose colour without an
+				// on_off to hang a Lightbulb on, and the answer to whether
+				// that is worth mapping depends on which model it supports.
+				entry := "color_setting"
+				if params, err := c.ColorParameters(); err == nil {
+					if desc := params.Describe(); desc != "" {
+						entry += " (" + desc + ")"
+					}
+				}
+				unmapped = append(unmapped, entry)
 			}
 
 		case yandex.CapabilityToggle:
@@ -523,6 +569,19 @@ func describeMapping(dev yandex.Device, spec Spec) (mapped, unmapped []string) {
 	}
 
 	for _, p := range dev.Properties {
+		if p.Type == yandex.PropertyEvent {
+			instance := p.Instance()
+			switch {
+			case instance == yandex.EventBatteryLevel:
+				note(spec.HasSensor(SensorBattery), "event:battery_level → StatusLowBattery")
+			case eventSensors[instance] != "":
+				kind := eventSensors[instance]
+				note(spec.HasSensor(kind), fmt.Sprintf("event:%s → %s sensor", instance, kind))
+			default:
+				unmapped = append(unmapped, withInstance(string(p.Type), instance))
+			}
+			continue
+		}
 		if p.Type != yandex.PropertyFloat {
 			unmapped = append(unmapped, withInstance(string(p.Type), p.Instance()))
 			continue

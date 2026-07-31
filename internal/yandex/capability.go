@@ -3,6 +3,7 @@ package yandex
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // CapabilityType identifies a controllable device function.
@@ -218,12 +219,22 @@ type TemperatureKRange struct {
 	Max float64 `json:"max"`
 }
 
+// ColorScenes lists the named lighting scenes a device accepts.
+type ColorScenes struct {
+	Scenes []struct {
+		ID string `json:"id"`
+	} `json:"scenes"`
+}
+
 // ColorParams are the parameters of a color_setting capability.
 type ColorParams struct {
 	// ColorModel is "hsv" or "rgb" when the device supports arbitrary colours.
 	ColorModel string `json:"color_model"`
 	// TemperatureK is set when the device supports white temperature.
 	TemperatureK *TemperatureKRange `json:"temperature_k"`
+	// ColorScene is set when the device only accepts named scenes — some
+	// devices, notably Yandex speakers with a light ring, offer nothing else.
+	ColorScene *ColorScenes `json:"color_scene"`
 }
 
 // SupportsColor reports whether arbitrary colours can be set.
@@ -231,6 +242,30 @@ func (p ColorParams) SupportsColor() bool { return p.ColorModel != "" }
 
 // SupportsTemperature reports whether white temperature can be set.
 func (p ColorParams) SupportsTemperature() bool { return p.TemperatureK != nil }
+
+// SupportsScenes reports whether named scenes can be selected.
+func (p ColorParams) SupportsScenes() bool {
+	return p.ColorScene != nil && len(p.ColorScene.Scenes) > 0
+}
+
+// Describe summarises what a colour capability offers, for the inventory.
+func (p ColorParams) Describe() string {
+	var parts []string
+	if p.ColorModel != "" {
+		parts = append(parts, p.ColorModel)
+	}
+	if p.SupportsTemperature() {
+		parts = append(parts, fmt.Sprintf("temperature_k %g..%g", p.TemperatureK.Min, p.TemperatureK.Max))
+	}
+	if p.SupportsScenes() {
+		ids := make([]string, 0, len(p.ColorScene.Scenes))
+		for _, s := range p.ColorScene.Scenes {
+			ids = append(ids, s.ID)
+		}
+		parts = append(parts, "scenes: "+strings.Join(ids, "/"))
+	}
+	return strings.Join(parts, ", ")
+}
 
 // ColorParameters decodes the parameters of a color_setting capability.
 func (c Capability) ColorParameters() (ColorParams, error) {
@@ -309,13 +344,32 @@ func (c Capability) ColorState() (ColorState, error) {
 
 // Event property instances.
 const (
-	EventButton    = "button"
-	EventMotion    = "motion"
-	EventOpen      = "open"
-	EventVibration = "vibration"
-	EventSmoke     = "smoke"
-	EventGas       = "gas"
-	EventWaterLeak = "water_leak"
+	EventButton       = "button"
+	EventMotion       = "motion"
+	EventOpen         = "open"
+	EventVibration    = "vibration"
+	EventSmoke        = "smoke"
+	EventGas          = "gas"
+	EventWaterLeak    = "water_leak"
+	EventBatteryLevel = "battery_level"
+	EventWaterLevel   = "water_level"
+)
+
+// Event property values.
+//
+// Most event instances report a state that persists until the next event —
+// "detected" stays until something reports "not_detected". That is what makes
+// them pollable at all: a value is never missed, only seen late.
+const (
+	EventValueDetected    = "detected"
+	EventValueNotDetected = "not_detected"
+	EventValueHigh        = "high"
+	EventValueOpened      = "opened"
+	EventValueClosed      = "closed"
+	EventValueLeak        = "leak"
+	EventValueDry         = "dry"
+	EventValueLow         = "low"
+	EventValueNormal      = "normal"
 )
 
 // Property is a read-only device reading.
@@ -362,6 +416,35 @@ func (p Property) FloatParameters() (FloatParams, error) {
 		return out, fmt.Errorf("decode float parameters: %w", err)
 	}
 	return out, nil
+}
+
+// EventState decodes the current value of an event property, such as
+// "detected" for motion or "opened" for a door.
+func (p Property) EventState() (string, error) {
+	if p.Type != PropertyEvent {
+		return "", fmt.Errorf("property is %s, not event", p.Type)
+	}
+	if rawOrNull(p.State) {
+		return "", ErrNoState
+	}
+	var s struct {
+		Instance string `json:"instance"`
+		Value    string `json:"value"`
+	}
+	if err := json.Unmarshal(p.State, &s); err != nil {
+		return "", fmt.Errorf("decode event state: %w", err)
+	}
+	return s.Value, nil
+}
+
+// EventProperty finds the event property for a given instance.
+func (d Device) EventProperty(instance string) (Property, bool) {
+	for _, p := range d.Properties {
+		if p.Type == PropertyEvent && p.Instance() == instance {
+			return p, true
+		}
+	}
+	return Property{}, false
 }
 
 // FloatState decodes the current value of a float property.

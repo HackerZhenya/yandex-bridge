@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -321,6 +322,63 @@ func TestStaleStateDoesNotOverwriteRecentWrite(t *testing.T) {
 	}
 	if got := acc.saturation.Value(); got != 89 {
 		t.Errorf("saturation = %v after a stale poll, want 89", got)
+	}
+}
+
+// TestValueIsProtectedBeforeYandexConfirms is the regression for the kettle
+// dial jumping back. Protection used to start only once Yandex accepted the
+// write, leaving the coalescing delay plus a round trip — close to a second —
+// during which a poll could put the old value straight back. Confirmation
+// reads run every second, so that window was hit routinely.
+func TestValueIsProtectedBeforeYandexConfirms(t *testing.T) {
+	cfg := config.Defaults()
+	acc, _, api := newAccessory(t, device(t, kettleJSON), cfg)
+	api.mu.Lock()
+	api.actDelay = 300 * time.Millisecond
+	api.mu.Unlock()
+
+	homeKitWrite(t, acc.targetTemp.C, 66.0)
+
+	// A poll lands while the write is still in flight, still reporting 80.
+	acc.Apply(device(t, kettleJSON))
+	if got := acc.targetTemp.Value(); got != 66 {
+		t.Errorf("TargetTemperature = %v during the write, want the requested 66", got)
+	}
+
+	settle(400 * time.Millisecond)
+	if got := acc.targetTemp.Value(); got != 66 {
+		t.Errorf("TargetTemperature = %v after the write, want 66", got)
+	}
+	if api.actionCount() != 1 {
+		t.Errorf("Yandex calls = %d, want 1", api.actionCount())
+	}
+}
+
+// TestCurrentModeFollowsTheUserImmediately covers the other half of the kettle
+// tile: the read-only current mode used to wait for the next poll, so for
+// several seconds HomeKit showed the kettle as off and heating at once.
+func TestCurrentModeFollowsTheUserImmediately(t *testing.T) {
+	cfg := config.Defaults()
+	acc, _, _ := newAccessory(t, device(t, kettleJSON), cfg)
+
+	acc.Apply(device(t, kettleJSON))
+	if acc.currentHeat.Value() != heatingStateHeat {
+		t.Fatalf("setup: current mode = %d, want Heat", acc.currentHeat.Value())
+	}
+
+	homeKitWrite(t, acc.targetState.C, heatingStateOff)
+	if got := acc.currentHeat.Value(); got != heatingStateOff {
+		t.Errorf("current mode = %d right after switching off, want Off", got)
+	}
+
+	// And a poll that has not caught up must not put "heating" back while the
+	// target is still protected.
+	acc.Apply(device(t, kettleJSON))
+	if got := acc.currentHeat.Value(); got != heatingStateOff {
+		t.Errorf("current mode = %d after a stale poll, want Off", got)
+	}
+	if got := acc.targetState.Value(); got != heatingStateOff {
+		t.Errorf("target mode = %d after a stale poll, want Off", got)
 	}
 }
 
@@ -894,6 +952,91 @@ func TestToggleSwitchesControlTheDevice(t *testing.T) {
 	action := actions[0].Devices[0].Actions[0]
 	if action.Type != yandex.CapabilityToggle || action.State.Instance != "keep_warm" {
 		t.Errorf("action = %+v, want toggle:keep_warm", action)
+	}
+}
+
+// --- event sensors ---
+
+func TestMotionSensorFollowsTheEvent(t *testing.T) {
+	cfg := config.Defaults()
+	raw := `{"id":"speaker","name":"Малинка","type":"devices.types.sensor","properties":[%s]}`
+	detected := device(t, fmt.Sprintf(raw, motionEvent))
+
+	acc, _, _ := newAccessory(t, detected, cfg)
+	if acc.motion == nil {
+		t.Fatal("MotionSensor service was not created")
+	}
+
+	acc.Apply(detected)
+	if !acc.motion.Value() {
+		t.Error("MotionDetected = false after a detected event")
+	}
+
+	clear := device(t, fmt.Sprintf(raw,
+		`{"type":"devices.properties.event","retrievable":true,
+		  "parameters":{"instance":"motion"},
+		  "state":{"instance":"motion","value":"not_detected"}}`))
+	acc.Apply(clear)
+	if acc.motion.Value() {
+		t.Error("MotionDetected stayed true after not_detected")
+	}
+}
+
+// TestContactSensorInvertsYandexWording covers an easy off-by-one in meaning:
+// Yandex says "opened", HomeKit's 0 means "contact detected", i.e. shut.
+func TestContactSensorInvertsYandexWording(t *testing.T) {
+	cfg := config.Defaults()
+	raw := `{"id":"door","name":"Дверь","type":"devices.types.sensor.open","properties":[%s]}`
+
+	opened := device(t, fmt.Sprintf(raw, openEvent))
+	acc, _, _ := newAccessory(t, opened, cfg)
+
+	acc.Apply(opened)
+	if acc.contact.Value() != contactNotDetected {
+		t.Errorf("ContactSensorState = %d for an open door, want %d",
+			acc.contact.Value(), contactNotDetected)
+	}
+
+	closed := device(t, fmt.Sprintf(raw,
+		`{"type":"devices.properties.event","retrievable":true,
+		  "parameters":{"instance":"open"},
+		  "state":{"instance":"open","value":"closed"}}`))
+	acc.Apply(closed)
+	if acc.contact.Value() != contactDetected {
+		t.Errorf("ContactSensorState = %d for a closed door, want %d",
+			acc.contact.Value(), contactDetected)
+	}
+}
+
+func TestLeakAndSmokeRaiseAlarms(t *testing.T) {
+	cfg := config.Defaults()
+	dev := device(t, `{"id":"d","name":"Датчик","type":"devices.types.sensor",
+		"properties":[`+leakEvent+`,`+smokeHighEvent+`]}`)
+	acc, _, _ := newAccessory(t, dev, cfg)
+
+	acc.Apply(dev)
+	if acc.leak.Value() != 1 {
+		t.Errorf("LeakDetected = %d, want 1", acc.leak.Value())
+	}
+	// "high" means the sensor is more certain, not less.
+	if acc.smoke.Value() != 1 {
+		t.Errorf("SmokeDetected = %d for a high reading, want 1", acc.smoke.Value())
+	}
+}
+
+func TestBatteryEventDrivesLowBatteryWarning(t *testing.T) {
+	cfg := config.Defaults()
+	dev := device(t, `{"id":"d","name":"Датчик","type":"devices.types.sensor",
+		"properties":[`+motionEvent+`,`+batteryEvent+`]}`)
+	acc, _, _ := newAccessory(t, dev, cfg)
+
+	acc.Apply(dev)
+	if acc.battery == nil {
+		t.Fatal("BatteryService was not created")
+	}
+	if acc.battery.StatusLowBattery.Value() != 1 {
+		t.Errorf("StatusLowBattery = %d for a low reading, want 1",
+			acc.battery.StatusLowBattery.Value())
 	}
 }
 
