@@ -1,0 +1,153 @@
+{
+  "status": "ok",
+  "request_id": "8348dba1-ad56-4984-b953-ccd27e42f009",
+  "rooms": [
+    {
+      "id": "room-id-1",
+      "name": "Гостиная",
+      "household_id": "household-id-1",
+      "devices": ["lamp-id-1", "socket-id-1"]
+    }
+  ],
+  "groups": [
+    {
+      "id": "light-group-id-1",
+      "name": "Люстра",
+      "aliases": ["Верхний свет"],
+      "household_id": "household-id-1",
+      "type": "devices.types.light",
+      "devices": ["lamp-id-1"],
+      "capabilities": [
+        {
+          "retrievable": true,
+          "type": "devices.capabilities.on_off",
+          "parameters": {"split": false},
+          "state": {"instance": "on", "value": false}
+        }
+      ]
+    }
+  ],
+  "devices": [
+    {
+      "id": "lamp-id-1",
+      "name": "Лампочка 1",
+      "aliases": [],
+      "type": "devices.types.light.ceiling",
+      "external_id": "external-lamp-id-1",
+      "skill_id": "skill-id-1",
+      "household_id": "household-id-1",
+      "room": "room-id-1",
+      "groups": ["light-group-id-1"],
+      "capabilities": [
+        {
+          "reportable": false,
+          "retrievable": true,
+          "type": "devices.capabilities.on_off",
+          "parameters": {"split": false},
+          "state": {"instance": "on", "value": true},
+          "last_updated": 1626681729.2964342
+        },
+        {
+          "reportable": false,
+          "retrievable": true,
+          "type": "devices.capabilities.range",
+          "parameters": {
+            "instance": "brightness",
+            "unit": "unit.percent",
+            "random_access": true,
+            "range": {"min": 1, "max": 100, "precision": 1}
+          },
+          "state": {"instance": "brightness", "value": 40},
+          "last_updated": 1626681729.2964342
+        },
+        {
+          "reportable": false,
+          "retrievable": true,
+          "type": "devices.capabilities.color_setting",
+          "parameters": {
+            "color_model": "hsv",
+            "temperature_k": {"min": 2700, "max": 6500}
+          },
+          "state": {"instance": "hsv", "value": {"h": 210, "s": 80, "v": 60}},
+          "last_updated": 1626681729.2964342
+        }
+      ],
+      "properties": []
+    },
+    {
+      "id": "socket-id-1",
+      "name": "Розетка у окна",
+      "aliases": [],
+      "type": "devices.types.socket",
+      "external_id": "external-socket-1",
+      "skill_id": "skill-id-2",
+      "household_id": "household-id-1",
+      "room": "room-id-1",
+      "groups": [],
+      "capabilities": [
+        {
+          "reportable": true,
+          "retrievable": true,
+          "type": "devices.capabilities.on_off",
+          "parameters": {"split": false},
+          "state": {"instance": "on", "value": false},
+          "last_updated": 1626681800.1
+        }
+      ],
+      "properties": [
+        {
+          "type": "devices.properties.float",
+          "retrievable": true,
+          "reportable": true,
+          "parameters": {"instance": "power", "unit": "unit.watt"},
+          "state": {"instance": "power", "value": 12.5},
+          "last_updated": 1626681800.1
+        }
+      ]
+    },
+    {
+      "id": "climate-id-1",
+      "name": "Датчик в спальне",
+      "aliases": [],
+      "type": "devices.types.sensor.climate",
+      "external_id": "external-climate-1",
+      "skill_id": "skill-id-3",
+      "household_id": "household-id-1",
+      "room": null,
+      "groups": [],
+      "capabilities": [],
+      "properties": [
+        {
+          "type": "devices.properties.float",
+          "retrievable": true,
+          "reportable": true,
+          "parameters": {"instance": "temperature", "unit": "unit.temperature.celsius"},
+          "state": {"instance": "temperature", "value": 21.7},
+          "last_updated": 1626681900.5
+        },
+        {
+          "type": "devices.properties.float",
+          "retrievable": true,
+          "reportable": true,
+          "parameters": {"instance": "humidity", "unit": "unit.percent"},
+          "state": {"instance": "humidity", "value": 47},
+          "last_updated": 1626681900.5
+        },
+        {
+          "type": "devices.properties.float",
+          "retrievable": true,
+          "reportable": true,
+          "parameters": {"instance": "battery_level", "unit": "unit.percent"},
+          "state": {"instance": "battery_level", "value": 18},
+          "last_updated": 1626681900.5
+        }
+      ]
+    }
+  ],
+  "scenarios": [
+    {"id": "scenario-id-1", "name": "Световой будильник", "is_active": true}
+  ],
+  "households": [
+    {"id": "household-id-1", "name": "Мой дом"}
+  ]
+}

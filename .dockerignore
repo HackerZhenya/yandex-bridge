@@ -1,0 +1,8 @@
+.git
+.gitignore
+.idea
+data
+*.md
+compose.yaml
+config.example.yaml
+.env

@@ -1,0 +1,8 @@
+# Runtime state: HAP pairings, OAuth token, accessory id registry.
+# Never commit this — token.json is a live credential.
+/data/
+.env
+
+# Build output
+/yandex-bridge
+/out/

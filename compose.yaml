@@ -1,0 +1,53 @@
+services:
+  yandex-bridge:
+    build: .
+    image: yandex-bridge:latest
+    container_name: yandex-bridge
+    restart: unless-stopped
+
+    # Host networking is mandatory, not a convenience.
+    #
+    # HomeKit finds accessories over mDNS: multicast UDP on 224.0.0.251:5353,
+    # with a TTL of 1. Those packets do not cross Docker's bridge NAT, so in
+    # any other network mode the iPhone never sees the bridge and pairing
+    # simply never offers it.
+    #
+    # Note this also means the container shares the host's port space: 51826
+    # and 8080 must be free on the Pi itself.
+    network_mode: host
+
+    # The image runs as uid 10001, which cannot write to a bind-mounted ./data
+    # owned by your account. Either chown the directory once:
+    #     mkdir -p data && sudo chown -R 10001:10001 data
+    # or set PUID/PGID in .env to your own ids (`id -u` / `id -g`) so the
+    # container writes as you and the files stay readable.
+    user: "${PUID:-10001}:${PGID:-10001}"
+
+    environment:
+      # Created at https://oauth.yandex.ru/client/new with the scopes
+      # iot:view and iot:control.
+      YANDEX_CLIENT_ID: "${YANDEX_CLIENT_ID:?set YANDEX_CLIENT_ID in .env}"
+      YANDEX_CLIENT_SECRET: "${YANDEX_CLIENT_SECRET:?set YANDEX_CLIENT_SECRET in .env}"
+
+      # Eight digits, entered in the Home app when adding the bridge.
+      # Pick your own; HomeKit rejects trivial codes like 12345678.
+      HOMEKIT_PIN: "${HOMEKIT_PIN:?set HOMEKIT_PIN in .env}"
+
+      # Announce on one interface only. Advertising the bridge on eth0, wlan0
+      # and docker0 at once is a known way to make HomeKit lose track of it.
+      HOMEKIT_INTERFACES: "${HOMEKIT_INTERFACES:-eth0}"
+
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      TZ: "${TZ:-Europe/Moscow}"
+
+    volumes:
+      # HAP pairing data, the OAuth token, the accessory id registry and the
+      # optional config.yaml. Losing this volume means re-pairing the bridge
+      # and re-adding every accessory in the Home app.
+      - ./data:/data
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
