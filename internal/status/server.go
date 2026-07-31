@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"yandex-bridge/internal/auth"
+	"yandex-bridge/internal/bridge"
 )
 
 // Health reports the bridge's own view of whether it is working.
@@ -36,25 +37,33 @@ type Link interface {
 	LastPoll() time.Time
 }
 
-// Server serves /healthz and /readyz.
+// Inventory reports what the bridge found in the Yandex account and what it
+// mapped each device to.
+type Inventory interface {
+	Inventory() []bridge.MappingReport
+}
+
+// Server serves /healthz, /readyz and /devices.
 type Server struct {
-	addr   string
-	health Health
-	tokens Tokens
-	link   Link
-	logger *slog.Logger
-	start  time.Time
+	addr      string
+	health    Health
+	tokens    Tokens
+	link      Link
+	inventory Inventory
+	logger    *slog.Logger
+	start     time.Time
 }
 
 // NewServer returns a status server bound to addr.
-func NewServer(addr string, health Health, tokens Tokens, link Link, logger *slog.Logger) *Server {
+func NewServer(addr string, health Health, tokens Tokens, link Link, inventory Inventory, logger *slog.Logger) *Server {
 	return &Server{
-		addr:   addr,
-		health: health,
-		tokens: tokens,
-		link:   link,
-		logger: logger,
-		start:  time.Now(),
+		addr:      addr,
+		health:    health,
+		tokens:    tokens,
+		link:      link,
+		inventory: inventory,
+		logger:    logger,
+		start:     time.Now(),
 	}
 }
 
@@ -88,6 +97,7 @@ type linkSnapshot struct {
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /devices", s.handleDevices)
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -115,6 +125,34 @@ func (s *Server) Run(ctx context.Context) error {
 			return nil
 		}
 		return err
+	}
+}
+
+// handleDevices serves the mapping report.
+//
+// The device ids needed to write config.yaml are opaque UUIDs that appear
+// nowhere in the Home app, so copying them out of a log line is painful. This
+// makes it one curl.
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
+	var reports []bridge.MappingReport
+	if s.inventory != nil {
+		reports = s.inventory.Inventory()
+	}
+
+	body := struct {
+		Count   int                    `json:"count"`
+		Devices []bridge.MappingReport `json:"devices"`
+	}{Count: len(reports), Devices: reports}
+
+	w.Header().Set("Content-Type", "application/json")
+	if reports == nil {
+		// Nothing polled yet: an empty list would look like an empty account.
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(body); err != nil {
+		s.logger.Debug("write devices response", slog.String("error", err.Error()))
 	}
 }
 

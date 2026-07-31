@@ -34,13 +34,14 @@ type Refresher interface {
 // exception is a 401 on a token we believed to be valid, which means the token
 // was revoked server-side rather than expired — see do.
 type Client struct {
-	httpClient  *http.Client
-	baseURL     string
-	logger      *slog.Logger
-	refresher   Refresher
-	userAgent   string
-	readPolicy  RetryPolicy
-	writePolicy RetryPolicy
+	httpClient    *http.Client
+	baseURL       string
+	logger        *slog.Logger
+	refresher     Refresher
+	userAgent     string
+	readPolicy    RetryPolicy
+	writePolicy   RetryPolicy
+	confirmPolicy RetryPolicy
 }
 
 // Option customises a Client.
@@ -72,6 +73,11 @@ func WithWritePolicy(p RetryPolicy) Option {
 	return func(c *Client) { c.writePolicy = p }
 }
 
+// WithConfirmPolicy overrides the retry policy used for single-device reads.
+func WithConfirmPolicy(p RetryPolicy) Option {
+	return func(c *Client) { c.confirmPolicy = p }
+}
+
 // New returns a Client. httpClient must attach the Authorization header;
 // if it is nil, a default client with a 30s timeout is used and requests will
 // fail with 401 until a token-attaching transport is supplied.
@@ -80,12 +86,13 @@ func New(httpClient *http.Client, opts ...Option) *Client {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	c := &Client{
-		httpClient:  httpClient,
-		baseURL:     BaseURL,
-		logger:      slog.Default(),
-		userAgent:   "yandex-bridge/1.0",
-		readPolicy:  ReadPolicy,
-		writePolicy: WritePolicy,
+		httpClient:    httpClient,
+		baseURL:       BaseURL,
+		logger:        slog.Default(),
+		userAgent:     "yandex-bridge/1.0",
+		readPolicy:    ReadPolicy,
+		writePolicy:   WritePolicy,
+		confirmPolicy: ConfirmPolicy,
 	}
 	for _, o := range opts {
 		o(c)
@@ -108,7 +115,9 @@ func (c *Client) UserInfo(ctx context.Context) (*UserInfo, error) {
 }
 
 // Device fetches the state of a single device. Used for the fast confirmation
-// polls right after a write, where re-fetching the whole home would be wasteful.
+// polls right after a write, where re-fetching the whole home would be
+// wasteful — hence the short retry policy, which keeps a slow response from
+// eating the whole confirmation window.
 func (c *Client) Device(ctx context.Context, deviceID string) (*Device, error) {
 	if deviceID == "" {
 		return nil, fmt.Errorf("device id must not be empty")
@@ -116,7 +125,7 @@ func (c *Client) Device(ctx context.Context, deviceID string) (*Device, error) {
 	path := "/v1.0/devices/" + url.PathEscape(deviceID)
 
 	var out Device
-	err := c.readPolicy.Do(ctx, c.logger, "device", func(ctx context.Context) error {
+	err := c.confirmPolicy.Do(ctx, c.logger, "device", func(ctx context.Context) error {
 		return c.do(ctx, http.MethodGet, path, nil, &out)
 	})
 	if err != nil {

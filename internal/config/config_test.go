@@ -135,6 +135,90 @@ func TestEnvironmentOverridesFile(t *testing.T) {
 	}
 }
 
+func TestTogglesAndHealthDefaultOn(t *testing.T) {
+	setEnv(t)
+	t.Setenv("DATA_DIR", t.TempDir())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.ExposeToggles {
+		t.Error("ExposeToggles = false, want toggles exported by default")
+	}
+	if !cfg.Health.Enabled || !cfg.Health.ReauthButton {
+		t.Errorf("Health = %+v, want both on by default", cfg.Health)
+	}
+	if cfg.SettleWindow.Std() != 10*time.Second {
+		t.Errorf("SettleWindow = %s, want 10s", cfg.SettleWindow.Std())
+	}
+	if cfg.CoalesceDelay.Std() != 60*time.Millisecond {
+		t.Errorf("CoalesceDelay = %s, want 60ms", cfg.CoalesceDelay.Std())
+	}
+}
+
+// TestBooleansCanBeTurnedOff guards the decode-over-defaults trick: a key set
+// to false must win over a default of true.
+func TestBooleansCanBeTurnedOff(t *testing.T) {
+	setEnv(t)
+	dir := t.TempDir()
+	t.Setenv("DATA_DIR", dir)
+
+	yaml := "expose_toggles: false\nhealth:\n  enabled: false\n  reauth_button: false\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ExposeToggles {
+		t.Error("expose_toggles: false was ignored")
+	}
+	if cfg.Health.Enabled || cfg.Health.ReauthButton {
+		t.Errorf("Health = %+v, want both off", cfg.Health)
+	}
+}
+
+func TestHideTogglesIsPerDevice(t *testing.T) {
+	setEnv(t)
+	dir := t.TempDir()
+	t.Setenv("DATA_DIR", dir)
+
+	yaml := "devices:\n  \"kettle\":\n    type: thermostat\n    hide_toggles: [backlight]\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	o := cfg.Override("kettle")
+	if o.Type != TypeThermostat {
+		t.Errorf("Type = %q, want thermostat", o.Type)
+	}
+	if !o.TogglesHidden("backlight") {
+		t.Error("backlight is not reported as hidden")
+	}
+	if o.TogglesHidden("keep_warm") {
+		t.Error("keep_warm was hidden without being listed")
+	}
+}
+
+func TestValidateRejectsAbsurdCoalesceDelay(t *testing.T) {
+	cfg := Defaults()
+	cfg.Yandex = Yandex{ClientID: "a", ClientSecret: "b"}
+	cfg.HomeKit.Pin = "01020030"
+	// Beyond a second a tap on a light switch starts to feel broken.
+	cfg.CoalesceDelay = Duration(5 * time.Second)
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted a 5s coalesce delay")
+	}
+}
+
 func TestValidatePin(t *testing.T) {
 	tests := []struct {
 		pin     string

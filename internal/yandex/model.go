@@ -26,6 +26,13 @@ const (
 	DeviceTypeSwitch        DeviceType = "devices.types.switch"
 	DeviceTypeSensor        DeviceType = "devices.types.sensor"
 	DeviceTypeSensorClimate DeviceType = "devices.types.sensor.climate"
+	// DeviceTypeCooking covers kettles, coffee makers and multicookers.
+	DeviceTypeCooking DeviceType = "devices.types.cooking"
+	// DeviceTypeThermostat is a heater with a target temperature.
+	DeviceTypeThermostat DeviceType = "devices.types.thermostat"
+	// DeviceTypeThermostatAC is an air conditioner. It carries a temperature
+	// range like a thermostat but also cools, so it is treated separately.
+	DeviceTypeThermostatAC DeviceType = "devices.types.thermostat.ac"
 )
 
 // Base returns the type without its subtype, so that

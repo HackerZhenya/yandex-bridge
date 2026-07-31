@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"yandex-bridge/internal/auth"
+	"yandex-bridge/internal/bridge"
 )
 
 type stubHealth struct {
@@ -35,8 +36,17 @@ func (s stubLink) Reachable() bool     { return s.reachable }
 func (s stubLink) Failures() int       { return s.failures }
 func (s stubLink) LastPoll() time.Time { return s.lastPoll }
 
+type stubInventory struct{ reports []bridge.MappingReport }
+
+func (s stubInventory) Inventory() []bridge.MappingReport { return s.reports }
+
 func newServer(h Health, t Tokens, l Link) *Server {
-	return NewServer(":0", h, t, l, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewServer(":0", h, t, l, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func newServerWithInventory(reports []bridge.MappingReport) *Server {
+	return NewServer(":0", stubHealth{healthy: true}, nil, nil,
+		stubInventory{reports: reports}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func get(t *testing.T, s *Server) (int, snapshot, string) {
@@ -136,6 +146,52 @@ func TestNoTokenOrLinkIsTolerated(t *testing.T) {
 	code, _, _ := get(t, s)
 	if code != http.StatusOK {
 		t.Errorf("status = %d, want 200", code)
+	}
+}
+
+// TestDevicesEndpointCarriesWhatConfigNeeds covers the reason the endpoint
+// exists: the device id is an opaque UUID that appears nowhere in the Home
+// app, and an unmapped capability is otherwise invisible.
+func TestDevicesEndpointCarriesWhatConfigNeeds(t *testing.T) {
+	s := newServerWithInventory([]bridge.MappingReport{{
+		DeviceID: "78c6e9de-ab96-48e1-84d6-099ea0474f72",
+		Name:     "Чайник",
+		Type:     "devices.types.cooking.kettle",
+		Room:     "Кухня",
+		Kind:     bridge.KindThermostat,
+		Mapped:   []string{"on_off → On"},
+		Unmapped: []string{"mode:tea_mode"},
+	}})
+
+	rec := httptest.NewRecorder()
+	s.handleDevices(rec, httptest.NewRequest(http.MethodGet, "/devices", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"78c6e9de-ab96-48e1-84d6-099ea0474f72",
+		"Чайник",
+		"devices.types.cooking.kettle",
+		"thermostat",
+		"mode:tea_mode",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body is missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestDevicesEndpointBeforeFirstPoll(t *testing.T) {
+	s := newServerWithInventory(nil)
+
+	rec := httptest.NewRecorder()
+	s.handleDevices(rec, httptest.NewRequest(http.MethodGet, "/devices", nil))
+
+	// An empty list with a 200 would read as "the account has no devices".
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 before the first poll", rec.Code)
 	}
 }
 

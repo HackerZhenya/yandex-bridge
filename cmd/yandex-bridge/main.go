@@ -79,8 +79,12 @@ func run() error {
 		slog.Int("known_devices", registry.Len()))
 
 	syncer := bridge.NewSyncer(api, cfg, logger)
-	health := bridge.NewHealth(cfg.HomeKit.Name+" Health", tokens, logger)
+	health := bridge.NewHealth(cfg.HomeKit.Name+" Health", tokens, cfg.Health.ReauthButton, logger)
 	syncer.SetObserver(health)
+	if !cfg.Health.Enabled {
+		logger.Info("Bridge Health accessory disabled; problems will only show " +
+			"in the logs, /healthz and as unresponsive accessories")
+	}
 
 	reauth := make(chan struct{}, 1)
 	health.SetReauthFunc(func() {
@@ -92,7 +96,7 @@ func run() error {
 
 	store := hap.NewFsStore(cfg.HAPStorePath())
 	supervisor := bridge.NewSupervisor(cfg, api, registry, syncer, health, store, logger)
-	statusSrv := status.NewServer(cfg.HealthAddr, health, tokens, syncer, logger)
+	statusSrv := status.NewServer(cfg.HealthAddr, health, tokens, syncer, supervisor, logger)
 
 	var wg sync.WaitGroup
 	background := func(name string, fn func()) {

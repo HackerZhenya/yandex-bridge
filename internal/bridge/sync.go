@@ -51,9 +51,14 @@ type Syncer struct {
 	// the new state is not visible immediately.
 	confirm chan string
 
-	// onDevices, when set, receives the device list from every successful
-	// poll. The supervisor uses it to watch for topology changes.
-	onDevices func([]yandex.Device)
+	// confirming tracks devices with a confirmation window already running,
+	// so a burst of writes cannot queue up a burst of windows.
+	confirmMu  sync.Mutex
+	confirming map[string]bool
+
+	// onPoll, when set, receives the result of every successful poll. The
+	// supervisor uses it to watch for topology changes.
+	onPoll func(*yandex.UserInfo)
 }
 
 // NewSyncer returns a Syncer for the given accessories, keyed by device id.
@@ -65,6 +70,7 @@ func NewSyncer(api API, cfg config.Config, logger *slog.Logger) *Syncer {
 		accessories: make(map[string]*Accessory),
 		reachable:   true,
 		confirm:     make(chan string, 32),
+		confirming:  make(map[string]bool),
 	}
 }
 
@@ -86,12 +92,11 @@ func (s *Syncer) SetObserver(o Observer) {
 	s.obs = o
 }
 
-// OnDevices installs a callback invoked with the device list of every
-// successful poll.
-func (s *Syncer) OnDevices(fn func([]yandex.Device)) {
+// OnPoll installs a callback invoked with the result of every successful poll.
+func (s *Syncer) OnPoll(fn func(*yandex.UserInfo)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.onDevices = fn
+	s.onPoll = fn
 }
 
 // Reachable implements Controller. It reports whether the most recent
@@ -152,6 +157,12 @@ func (s *Syncer) Run(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Confirmations run on their own goroutine. Handling them here would let a
+	// burst of writes — a colour picker being dragged produces one per
+	// movement — block the poll loop for a confirmation window each, and the
+	// regular poll would stop running for as long as the queue took to drain.
+	go s.confirmLoop(ctx)
+
 	// Poll once immediately so HomeKit shows real state as soon as it pairs,
 	// rather than the zero values it was built with.
 	s.pollOnce(ctx)
@@ -162,10 +173,44 @@ func (s *Syncer) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.pollOnce(ctx)
-		case deviceID := <-s.confirm:
-			s.confirmDevice(ctx, deviceID)
 		}
 	}
+}
+
+// confirmLoop starts a confirmation window per device, at most one at a time.
+func (s *Syncer) confirmLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case deviceID := <-s.confirm:
+			if !s.beginConfirm(deviceID) {
+				// A window is already running for this device; it polls
+				// repeatedly and will see the newer state on its own.
+				continue
+			}
+			go func(id string) {
+				defer s.endConfirm(id)
+				s.confirmDevice(ctx, id)
+			}(deviceID)
+		}
+	}
+}
+
+func (s *Syncer) beginConfirm(deviceID string) bool {
+	s.confirmMu.Lock()
+	defer s.confirmMu.Unlock()
+	if s.confirming[deviceID] {
+		return false
+	}
+	s.confirming[deviceID] = true
+	return true
+}
+
+func (s *Syncer) endConfirm(deviceID string) {
+	s.confirmMu.Lock()
+	defer s.confirmMu.Unlock()
+	delete(s.confirming, deviceID)
 }
 
 // pollOnce fetches the whole home and applies it to the accessories.
@@ -182,7 +227,7 @@ func (s *Syncer) pollOnce(ctx context.Context) {
 
 	s.mu.RLock()
 	accessories := s.accessories
-	onDevices := s.onDevices
+	onPoll := s.onPoll
 	s.mu.RUnlock()
 
 	for _, dev := range info.Devices {
@@ -205,8 +250,8 @@ func (s *Syncer) pollOnce(ctx context.Context) {
 		}
 	}
 
-	if onDevices != nil {
-		onDevices(info.Devices)
+	if onPoll != nil {
+		onPoll(info)
 	}
 }
 

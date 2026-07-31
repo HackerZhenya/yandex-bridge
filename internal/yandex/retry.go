@@ -26,6 +26,14 @@ var ReadPolicy = RetryPolicy{MaxAttempts: 4, BaseDelay: time.Second, MaxDelay: 3
 // come on, so give up quickly and let HomeKit show "Not Responding".
 var WritePolicy = RetryPolicy{MaxAttempts: 3, BaseDelay: 300 * time.Millisecond, MaxDelay: 2 * time.Second}
 
+// ConfirmPolicy is used for the single-device reads that follow a write.
+//
+// These run inside a short confirmation window and repeat on their own every
+// second, so a generous backoff would simply consume the window and turn every
+// slow response into a context deadline. Failing fast and letting the next tick
+// try again is both quicker and quieter.
+var ConfirmPolicy = RetryPolicy{MaxAttempts: 2, BaseDelay: 250 * time.Millisecond, MaxDelay: time.Second}
+
 // Do runs fn, retrying while the error is retryable and attempts remain. The
 // error returned is the last one, so the caller sees the real cause rather
 // than a generic "gave up".

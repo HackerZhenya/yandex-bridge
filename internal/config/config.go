@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -28,14 +29,20 @@ const (
 	TypeOutlet    HomeKitType = "outlet"
 	TypeSwitch    HomeKitType = "switch"
 	TypeFan       HomeKitType = "fan"
+	// TypeThermostat exposes on/off, a target temperature and the current
+	// temperature as one HomeKit service. Devices that can heat to a
+	// temperature — a kettle, a thermostat — get it automatically; naming it
+	// here is how you force it on, or how "switch" forces it off.
+	TypeThermostat HomeKitType = "thermostat"
 )
 
 var validTypes = map[HomeKitType]bool{
-	TypeAuto:      true,
-	TypeLightbulb: true,
-	TypeOutlet:    true,
-	TypeSwitch:    true,
-	TypeFan:       true,
+	TypeAuto:       true,
+	TypeLightbulb:  true,
+	TypeOutlet:     true,
+	TypeSwitch:     true,
+	TypeFan:        true,
+	TypeThermostat: true,
 }
 
 // ColorMode selects which colour characteristics a light exposes. HomeKit
@@ -79,14 +86,32 @@ func (d Duration) Std() time.Duration { return time.Duration(d) }
 type DeviceOverride struct {
 	// Exclude hides the device from HomeKit entirely.
 	Exclude bool `yaml:"exclude"`
-	// Type forces a HomeKit accessory shape. The motivating case is a dumb
-	// fan plugged into a smart socket: type "fan" turns the socket into a
-	// HomeKit Fan with nothing but an on/off control.
+	// Type forces a HomeKit accessory shape. Two cases motivate it: a dumb
+	// fan plugged into a smart socket ("fan"), and preferring a plain switch
+	// plus a separate temperature reading over a combined thermostat tile
+	// ("switch").
 	Type HomeKitType `yaml:"type"`
 	// Name overrides the name shown in HomeKit.
 	Name string `yaml:"name"`
 	// ColorMode picks hue/saturation or colour temperature for lights.
 	ColorMode ColorMode `yaml:"color_mode"`
+	// HideToggles lists toggle instances to leave out of HomeKit, by their
+	// Yandex instance name (backlight, keep_warm, ...).
+	HideToggles []string `yaml:"hide_toggles"`
+}
+
+// TogglesHidden reports whether a toggle instance should be left out.
+func (o DeviceOverride) TogglesHidden(instance string) bool {
+	return slices.Contains(o.HideToggles, instance)
+}
+
+// Health configures the Bridge Health accessory.
+type Health struct {
+	// Enabled publishes the health accessory to HomeKit. Turning it off keeps
+	// /healthz and the logs but gives up push notifications about a dead token.
+	Enabled bool `yaml:"enabled"`
+	// ReauthButton adds the switch that restarts device authorization.
+	ReauthButton bool `yaml:"reauth_button"`
 }
 
 // HomeKit holds the HAP server settings.
@@ -127,9 +152,26 @@ type Config struct {
 	// UnhealthyAfter is how many consecutive failed polls trip Bridge Health.
 	UnhealthyAfter int `yaml:"unhealthy_after"`
 
+	// SettleWindow is how long a value written from HomeKit is protected from
+	// being overwritten by a poll that has not caught up yet. Yandex reaches
+	// devices through the vendor's cloud, so for a second or three after a
+	// write it still reports the old state; pushing that back into HomeKit is
+	// what makes a colour picker jump under the user's finger.
+	SettleWindow Duration `yaml:"settle_window"`
+
+	// CoalesceDelay is how long writes are buffered before being sent as one
+	// request. HomeKit sends hue and saturation in a single PUT, and hap hands
+	// them to the accessory one characteristic at a time; without this they
+	// would become two Yandex calls, the first one carrying a stale component.
+	CoalesceDelay Duration `yaml:"coalesce_delay"`
+
+	// ExposeToggles publishes devices.capabilities.toggle as extra switches.
+	ExposeToggles bool `yaml:"expose_toggles"`
+
 	LogLevel   string  `yaml:"log_level"`
 	HealthAddr string  `yaml:"health_addr"`
 	HomeKit    HomeKit `yaml:"homekit"`
+	Health     Health  `yaml:"health"`
 
 	// Devices maps a Yandex device id to its override.
 	Devices map[string]DeviceOverride `yaml:"devices"`
@@ -148,12 +190,19 @@ func Defaults() Config {
 		ConfirmInterval:       Duration(time.Second),
 		TopologyConfirmations: 3,
 		UnhealthyAfter:        4,
+		SettleWindow:          Duration(10 * time.Second),
+		CoalesceDelay:         Duration(60 * time.Millisecond),
+		ExposeToggles:         true,
 		LogLevel:              "info",
 		HealthAddr:            ":8080",
 		DataDir:               "/data",
 		HomeKit: HomeKit{
 			Name: "Yandex Bridge",
 			Port: 51826,
+		},
+		Health: Health{
+			Enabled:      true,
+			ReauthButton: true,
 		},
 	}
 }
@@ -259,6 +308,14 @@ func (c Config) Validate() error {
 	}
 	if c.HomeKit.Name == "" {
 		errs = append(errs, errors.New("homekit.name must not be empty"))
+	}
+	if c.SettleWindow.Std() < 0 {
+		errs = append(errs, errors.New("settle_window must not be negative"))
+	}
+	if d := c.CoalesceDelay.Std(); d < 0 || d > time.Second {
+		// Beyond a second the delay stops being imperceptible and a tap on a
+		// light switch starts to feel broken.
+		errs = append(errs, fmt.Errorf("coalesce_delay %s is outside the 0..1s range", d))
 	}
 
 	for id, o := range c.Devices {

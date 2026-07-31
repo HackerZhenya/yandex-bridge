@@ -56,9 +56,10 @@ type Health struct {
 	fault   *characteristic.StatusFault
 	reauth  *characteristic.On
 
-	name   string
-	tokens TokenSource
-	logger *slog.Logger
+	name         string
+	tokens       TokenSource
+	reauthButton bool
+	logger       *slog.Logger
 
 	mu       sync.Mutex
 	problems map[string]string
@@ -68,13 +69,15 @@ type Health struct {
 	reauthFn func()
 }
 
-// NewHealth builds the health accessory.
-func NewHealth(name string, tokens TokenSource, logger *slog.Logger) *Health {
+// NewHealth builds the health accessory. reauthButton adds the switch that
+// restarts device authorization.
+func NewHealth(name string, tokens TokenSource, reauthButton bool, logger *slog.Logger) *Health {
 	h := &Health{
-		name:     name,
-		tokens:   tokens,
-		logger:   logger,
-		problems: make(map[string]string),
+		name:         name,
+		tokens:       tokens,
+		reauthButton: reauthButton,
+		logger:       logger,
+		problems:     make(map[string]string),
 	}
 	h.Rebuild()
 	return h
@@ -106,12 +109,20 @@ func (h *Health) Rebuild() {
 	sensor.AddC(h.fault.C)
 	h.A.AddS(sensor.S)
 
-	// A switch the user can flip to re-run the device flow without SSHing
-	// into the Pi. It springs back to off once the flow has been kicked off.
-	reauthSwitch := service.NewSwitch()
-	h.reauth = reauthSwitch.On
-	h.reauth.OnSetRemoteValue(h.onReauthToggled)
-	h.A.AddS(reauthSwitch.S)
+	// A switch the user can flip to re-run the device flow without SSHing into
+	// the Pi.
+	//
+	// It rests in the *on* position and re-authorizing means turning it off,
+	// after which it springs back. A momentary switch has to sit in one state
+	// and be pushed out of it; parking it in "off" made the accessory look
+	// permanently broken at a glance.
+	if h.reauthButton {
+		reauthSwitch := service.NewSwitch()
+		h.reauth = reauthSwitch.On
+		h.reauth.SetValue(true)
+		h.reauth.OnSetRemoteValue(h.onReauthToggled)
+		h.A.AddS(reauthSwitch.S)
+	}
 
 	// Carry any problems recorded before the rebuild into the new
 	// characteristics, so a restart does not briefly report a healthy bridge.
@@ -125,8 +136,10 @@ func (h *Health) SetReauthFunc(fn func()) {
 	h.reauthFn = fn
 }
 
+// onReauthToggled fires when the user switches the control off, which is the
+// gesture that requests re-authorization.
 func (h *Health) onReauthToggled(on bool) error {
-	if !on {
+	if on {
 		return nil
 	}
 	h.mu.Lock()
@@ -139,11 +152,12 @@ func (h *Health) onReauthToggled(on bool) error {
 	h.logger.Info("re-authorization requested from the Home app")
 	go fn()
 
-	// Reset the switch so it reads as a button rather than a state. The reset
-	// runs in the background because hap is still inside this write.
+	// Spring back to the resting position so the control reads as a button
+	// rather than a state. The reset runs in the background because hap is
+	// still inside this write.
 	go func() {
 		time.Sleep(time.Second)
-		h.reauth.SetValue(false)
+		h.reauth.SetValue(true)
 	}()
 	return nil
 }

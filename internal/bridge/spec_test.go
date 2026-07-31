@@ -2,6 +2,8 @@ package bridge
 
 import (
 	"encoding/json"
+	"slices"
+	"strings"
 	"testing"
 
 	"yandex-bridge/internal/config"
@@ -17,6 +19,11 @@ func device(t *testing.T, raw string) yandex.Device {
 		t.Fatalf("build device: %v", err)
 	}
 	return d
+}
+
+// home wraps devices in the response shape BuildSpecs consumes.
+func home(devices ...yandex.Device) *yandex.UserInfo {
+	return &yandex.UserInfo{Devices: devices}
 }
 
 const (
@@ -36,6 +43,24 @@ const (
 	                       "parameters":{"temperature_k":{"min":2700,"max":6500}},
 	                       "state":{"instance":"temperature_k","value":4000}}`
 
+	// A kettle's settable target: 40-100 °C in steps of 10.
+	targetTempCap = `{"type":"devices.capabilities.range","retrievable":true,
+	                  "parameters":{"instance":"temperature","unit":"unit.temperature.celsius",
+	                                "random_access":true,"range":{"min":40,"max":100,"precision":10}},
+	                  "state":{"instance":"temperature","value":80}}`
+
+	keepWarmToggle = `{"type":"devices.capabilities.toggle","retrievable":true,
+	                   "parameters":{"instance":"keep_warm"},
+	                   "state":{"instance":"keep_warm","value":true}}`
+
+	backlightToggle = `{"type":"devices.capabilities.toggle","retrievable":true,
+	                    "parameters":{"instance":"backlight"},
+	                    "state":{"instance":"backlight","value":false}}`
+
+	teaModeCap = `{"type":"devices.capabilities.mode","retrievable":true,
+	               "parameters":{"instance":"tea_mode","modes":[{"value":"black_tea"}]},
+	               "state":{"instance":"tea_mode","value":"black_tea"}}`
+
 	temperatureProp = `{"type":"devices.properties.float","retrievable":true,
 	                    "parameters":{"instance":"temperature","unit":"unit.temperature.celsius"},
 	                    "state":{"instance":"temperature","value":21.5}}`
@@ -47,7 +72,21 @@ const (
 	batteryProp = `{"type":"devices.properties.float","retrievable":true,
 	                "parameters":{"instance":"battery_level","unit":"unit.percent"},
 	                "state":{"instance":"battery_level","value":15}}`
+
+	waterLevelProp = `{"type":"devices.properties.float","retrievable":true,
+	                   "parameters":{"instance":"water_level","unit":"unit.percent"},
+	                   "state":{"instance":"water_level","value":70}}`
 )
+
+// kettleJSON is the device this whole feature exists for.
+const kettleJSON = `{"id":"kettle","name":"Чайник","type":"devices.types.cooking.kettle",
+	"capabilities":[` + onOffCap + `,` + targetTempCap + `],
+	"properties":[` + temperatureProp + `]}`
+
+func buildSpec(t *testing.T, raw string, o config.DeviceOverride) (Spec, MappingReport, bool) {
+	t.Helper()
+	return BuildSpec(device(t, raw), o, true)
+}
 
 func TestBuildSpecKinds(t *testing.T) {
 	tests := []struct {
@@ -82,8 +121,8 @@ func TestBuildSpecKinds(t *testing.T) {
 			wantOK:   true,
 		},
 		{
-			// The user's case: a dumb fan on a smart socket, exported as a
-			// HomeKit Fan with nothing but on/off.
+			// A dumb fan on a smart socket, exported as a HomeKit Fan with
+			// nothing but on/off.
 			name:     "socket overridden to a fan",
 			raw:      `{"id":"d","name":"Розетка","type":"devices.types.socket","capabilities":[` + onOffCap + `]}`,
 			override: config.DeviceOverride{Type: config.TypeFan},
@@ -97,8 +136,10 @@ func TestBuildSpecKinds(t *testing.T) {
 			wantOK:   false,
 		},
 		{
-			name:     "unknown type with on_off falls back to a switch",
-			raw:      `{"id":"d","name":"Нечто","type":"devices.types.cooking.kettle","capabilities":[` + onOffCap + `]}`,
+			// Without a temperature range there is nothing to put on a
+			// thermostat dial, so a plain switch is the honest mapping.
+			name:     "kettle without a temperature range is a switch",
+			raw:      `{"id":"d","name":"Чайник","type":"devices.types.cooking.kettle","capabilities":[` + onOffCap + `]}`,
 			wantKind: KindSwitch,
 			wantOK:   true,
 		},
@@ -116,7 +157,7 @@ func TestBuildSpecKinds(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			spec, ok := BuildSpec(device(t, tt.raw), tt.override)
+			spec, _, ok := buildSpec(t, tt.raw, tt.override)
 			if ok != tt.wantOK {
 				t.Fatalf("BuildSpec ok = %v, want %v", ok, tt.wantOK)
 			}
@@ -127,9 +168,189 @@ func TestBuildSpecKinds(t *testing.T) {
 	}
 }
 
+// TestKettleBecomesOneThermostat is the mapping the whole feature exists for:
+// on/off, a target temperature and the current reading in a single service, so
+// the Home app shows one tile instead of a switch plus a thermometer.
+func TestKettleBecomesOneThermostat(t *testing.T) {
+	spec, _, ok := buildSpec(t, kettleJSON, config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	if spec.Kind != KindThermostat {
+		t.Fatalf("Kind = %q, want thermostat", spec.Kind)
+	}
+	if spec.Target == nil {
+		t.Fatal("Target is nil, want the 40..100 range")
+	}
+	if spec.Target.Min != 40 || spec.Target.Max != 100 || spec.Target.Precision != 10 {
+		t.Errorf("Target = %+v, want 40..100 step 10", spec.Target)
+	}
+	// CurrentTemperature lives inside the Thermostat service; adding a sensor
+	// service too would put the kettle back to two tiles.
+	if spec.HasSensor(SensorTemperature) {
+		t.Error("a separate TemperatureSensor was added alongside the thermostat")
+	}
+}
+
+func TestKettleCanBeForcedBackToSwitchAndSensor(t *testing.T) {
+	spec, _, ok := buildSpec(t, kettleJSON, config.DeviceOverride{Type: config.TypeSwitch})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	if spec.Kind != KindSwitch {
+		t.Errorf("Kind = %q, want switch", spec.Kind)
+	}
+	if !spec.HasSensor(SensorTemperature) {
+		t.Error("the temperature reading was dropped instead of becoming a sensor")
+	}
+	if spec.Target != nil {
+		t.Error("a switch should not carry a target temperature")
+	}
+}
+
+// TestAirConditionerIsNotATermostat guards the one device that also carries a
+// temperature range but must not be presented as heat-only.
+func TestAirConditionerIsNotAThermostat(t *testing.T) {
+	spec, _, ok := buildSpec(t,
+		`{"id":"ac","name":"Кондиционер","type":"devices.types.thermostat.ac",
+		  "capabilities":[`+onOffCap+`,`+targetTempCap+`]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	if spec.Kind == KindThermostat {
+		t.Error("an air conditioner was mapped as a heat-only thermostat")
+	}
+}
+
+func TestThermostatOverrideNeedsATemperatureRange(t *testing.T) {
+	// Forcing the type cannot conjure a range; a dial that does nothing would
+	// be worse than a switch.
+	spec, _, ok := buildSpec(t,
+		`{"id":"d","name":"Штука","type":"devices.types.other","capabilities":[`+onOffCap+`]}`,
+		config.DeviceOverride{Type: config.TypeThermostat})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	if spec.Kind != KindSwitch {
+		t.Errorf("Kind = %q, want switch as a fallback", spec.Kind)
+	}
+}
+
+func TestTogglesBecomeSwitches(t *testing.T) {
+	spec, _, ok := buildSpec(t,
+		`{"id":"kettle","name":"Чайник","type":"devices.types.cooking.kettle",
+		  "capabilities":[`+onOffCap+`,`+targetTempCap+`,`+keepWarmToggle+`,`+backlightToggle+`]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	if len(spec.Toggles) != 2 {
+		t.Fatalf("Toggles = %+v, want 2", spec.Toggles)
+	}
+	// Sorted by instance so the service order — and the instance ids hap
+	// derives from it — stays stable across restarts.
+	if spec.Toggles[0].Instance != "backlight" || spec.Toggles[1].Instance != "keep_warm" {
+		t.Errorf("Toggles are not sorted by instance: %+v", spec.Toggles)
+	}
+	if spec.Toggles[0].Name != "Подсветка" {
+		t.Errorf("backlight name = %q, want a readable label", spec.Toggles[0].Name)
+	}
+}
+
+func TestHiddenTogglesAreDropped(t *testing.T) {
+	spec, _, ok := buildSpec(t,
+		`{"id":"kettle","name":"Чайник","type":"devices.types.cooking.kettle",
+		  "capabilities":[`+onOffCap+`,`+targetTempCap+`,`+keepWarmToggle+`,`+backlightToggle+`]}`,
+		config.DeviceOverride{HideToggles: []string{"backlight"}})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	if len(spec.Toggles) != 1 || spec.Toggles[0].Instance != "keep_warm" {
+		t.Errorf("Toggles = %+v, want only keep_warm", spec.Toggles)
+	}
+}
+
+func TestTogglesCanBeDisabledGlobally(t *testing.T) {
+	spec, _, ok := BuildSpec(device(t,
+		`{"id":"kettle","name":"Чайник","type":"devices.types.cooking.kettle",
+		  "capabilities":[`+onOffCap+`,`+targetTempCap+`,`+keepWarmToggle+`]}`),
+		config.DeviceOverride{}, false)
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	if len(spec.Toggles) != 0 {
+		t.Errorf("Toggles = %+v, want none when expose_toggles is off", spec.Toggles)
+	}
+}
+
+func TestUnknownToggleKeepsItsRawName(t *testing.T) {
+	spec, _, ok := buildSpec(t,
+		`{"id":"d","name":"Штука","type":"devices.types.other","capabilities":[`+onOffCap+`,
+		  {"type":"devices.capabilities.toggle","parameters":{"instance":"warp_drive"},
+		   "state":{"instance":"warp_drive","value":false}}]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+	// Dropping it would silently lose a control the user can see in the
+	// Yandex app.
+	if len(spec.Toggles) != 1 || spec.Toggles[0].Name != "warp_drive" {
+		t.Errorf("Toggles = %+v, want the raw instance as a label", spec.Toggles)
+	}
+}
+
+// TestMappingReportNamesWhatIsLost is what makes config.yaml writable: an
+// unsupported capability is otherwise invisible.
+func TestMappingReportNamesWhatIsLost(t *testing.T) {
+	_, report, ok := buildSpec(t,
+		`{"id":"kettle","name":"Чайник","type":"devices.types.cooking.kettle",
+		  "capabilities":[`+onOffCap+`,`+targetTempCap+`,`+teaModeCap+`],
+		  "properties":[`+temperatureProp+`,`+waterLevelProp+`]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+
+	joinedUnmapped := strings.Join(report.Unmapped, " ")
+	for _, want := range []string{"devices.capabilities.mode", "float:water_level"} {
+		if !strings.Contains(joinedUnmapped, want) {
+			t.Errorf("unmapped = %v, want it to mention %q", report.Unmapped, want)
+		}
+	}
+
+	joinedMapped := strings.Join(report.Mapped, " ")
+	for _, want := range []string{"on_off", "range:temperature", "float:temperature"} {
+		if !strings.Contains(joinedMapped, want) {
+			t.Errorf("mapped = %v, want it to mention %q", report.Mapped, want)
+		}
+	}
+}
+
+func TestSkippedDeviceCarriesAReason(t *testing.T) {
+	_, report, ok := buildSpec(t,
+		`{"id":"d","name":"Пылесос","type":"devices.types.vacuum_cleaner"}`,
+		config.DeviceOverride{})
+	if ok {
+		t.Fatal("BuildSpec exported a device it cannot map")
+	}
+	if !report.Skipped || report.Reason == "" {
+		t.Errorf("report = %+v, want skipped with a reason", report)
+	}
+}
+
+func TestExcludedDeviceSaysSo(t *testing.T) {
+	_, report, _ := buildSpec(t,
+		`{"id":"d","name":"Розетка","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`,
+		config.DeviceOverride{Exclude: true})
+	if !strings.Contains(report.Reason, "config") {
+		t.Errorf("reason = %q, want it to point at the config", report.Reason)
+	}
+}
+
 func TestBuildSpecBrightness(t *testing.T) {
-	spec, ok := BuildSpec(device(t,
-		`{"id":"d","name":"L","type":"devices.types.light","capabilities":[`+onOffCap+`,`+brightnessCap+`]}`),
+	spec, _, ok := buildSpec(t,
+		`{"id":"d","name":"L","type":"devices.types.light","capabilities":[`+onOffCap+`,`+brightnessCap+`]}`,
 		config.DeviceOverride{})
 	if !ok {
 		t.Fatal("BuildSpec returned false")
@@ -189,7 +410,7 @@ func TestColorModeIsExclusive(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			spec, ok := BuildSpec(device(t, tt.raw), tt.override)
+			spec, _, ok := buildSpec(t, tt.raw, tt.override)
 			if !ok {
 				t.Fatal("BuildSpec returned false")
 			}
@@ -206,9 +427,9 @@ func TestColorModeIsExclusive(t *testing.T) {
 func TestSensorsAttachToAnyKind(t *testing.T) {
 	// A socket that also measures temperature stays one accessory rather than
 	// becoming a socket plus a separate sensor tile.
-	spec, ok := BuildSpec(device(t,
+	spec, _, ok := buildSpec(t,
 		`{"id":"d","name":"Розетка","type":"devices.types.socket","capabilities":[`+onOffCap+`],
-		  "properties":[`+temperatureProp+`,`+humidityProp+`,`+batteryProp+`]}`),
+		  "properties":[`+temperatureProp+`,`+humidityProp+`,`+batteryProp+`]}`,
 		config.DeviceOverride{})
 	if !ok {
 		t.Fatal("BuildSpec returned false")
@@ -224,8 +445,8 @@ func TestSensorsAttachToAnyKind(t *testing.T) {
 }
 
 func TestOverrideRenamesDevice(t *testing.T) {
-	spec, ok := BuildSpec(device(t,
-		`{"id":"d","name":"Розетка 3","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`),
+	spec, _, ok := buildSpec(t,
+		`{"id":"d","name":"Розетка 3","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`,
 		config.DeviceOverride{Type: config.TypeFan, Name: "Вентилятор в спальне"})
 	if !ok {
 		t.Fatal("BuildSpec returned false")
@@ -238,8 +459,8 @@ func TestOverrideRenamesDevice(t *testing.T) {
 func TestUnnamedDeviceFallsBackToItsID(t *testing.T) {
 	// hap refuses an accessory with an empty name, which would take down the
 	// whole server rather than just one device.
-	spec, ok := BuildSpec(device(t,
-		`{"id":"device-42","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`),
+	spec, _, ok := buildSpec(t,
+		`{"id":"device-42","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`,
 		config.DeviceOverride{})
 	if !ok {
 		t.Fatal("BuildSpec returned false")
@@ -250,10 +471,12 @@ func TestUnnamedDeviceFallsBackToItsID(t *testing.T) {
 }
 
 func TestShapeHashIgnoresName(t *testing.T) {
-	base := `{"id":"d","name":%q,"type":"devices.types.light","capabilities":[` + onOffCap + `]}`
-
-	a, _ := BuildSpec(device(t, jsonf(base, "Лампа")), config.DeviceOverride{})
-	b, _ := BuildSpec(device(t, jsonf(base, "Совсем другая лампа")), config.DeviceOverride{})
+	a, _, _ := buildSpec(t,
+		`{"id":"d","name":"Лампа","type":"devices.types.light","capabilities":[`+onOffCap+`]}`,
+		config.DeviceOverride{})
+	b, _, _ := buildSpec(t,
+		`{"id":"d","name":"Совсем другая лампа","type":"devices.types.light","capabilities":[`+onOffCap+`]}`,
+		config.DeviceOverride{})
 
 	// A rename must not count as a structural change: HomeKit keeps the user's
 	// own name anyway, so rebuilding the server for it is pure disruption.
@@ -263,15 +486,46 @@ func TestShapeHashIgnoresName(t *testing.T) {
 }
 
 func TestShapeHashTracksStructure(t *testing.T) {
-	plain, _ := BuildSpec(device(t,
-		`{"id":"d","name":"L","type":"devices.types.light","capabilities":[`+onOffCap+`]}`),
+	plain, _, _ := buildSpec(t,
+		`{"id":"d","name":"L","type":"devices.types.light","capabilities":[`+onOffCap+`]}`,
 		config.DeviceOverride{})
-	dimmable, _ := BuildSpec(device(t,
-		`{"id":"d","name":"L","type":"devices.types.light","capabilities":[`+onOffCap+`,`+brightnessCap+`]}`),
+	dimmable, _, _ := buildSpec(t,
+		`{"id":"d","name":"L","type":"devices.types.light","capabilities":[`+onOffCap+`,`+brightnessCap+`]}`,
 		config.DeviceOverride{})
 
 	if plain.ShapeHash() == dimmable.ShapeHash() {
 		t.Error("ShapeHash is the same with and without brightness")
+	}
+}
+
+// TestShapeHashTracksToggles matters because a toggle appearing or being
+// hidden changes the service list, and hap numbers instance ids by position.
+func TestShapeHashTracksToggles(t *testing.T) {
+	raw := `{"id":"kettle","name":"Чайник","type":"devices.types.cooking.kettle",
+	         "capabilities":[` + onOffCap + `,` + targetTempCap + `,` + keepWarmToggle + `]}`
+
+	with, _, _ := buildSpec(t, raw, config.DeviceOverride{})
+	without, _, _ := buildSpec(t, raw, config.DeviceOverride{HideToggles: []string{"keep_warm"}})
+
+	if with.ShapeHash() == without.ShapeHash() {
+		t.Error("hiding a toggle did not change ShapeHash")
+	}
+}
+
+func TestShapeHashTracksTargetTemperatureRange(t *testing.T) {
+	narrow, _, _ := buildSpec(t, kettleJSON, config.DeviceOverride{})
+	wide, _, _ := buildSpec(t,
+		`{"id":"kettle","name":"Чайник","type":"devices.types.cooking.kettle","capabilities":[`+onOffCap+`,
+		  {"type":"devices.capabilities.range","retrievable":true,
+		   "parameters":{"instance":"temperature","unit":"unit.temperature.celsius",
+		                 "range":{"min":30,"max":100,"precision":5}},
+		   "state":{"instance":"temperature","value":80}}]}`,
+		config.DeviceOverride{})
+
+	// The range drives the characteristic's advertised bounds, which HomeKit
+	// caches.
+	if narrow.ShapeHash() == wide.ShapeHash() {
+		t.Error("a different target temperature range did not change ShapeHash")
 	}
 }
 
@@ -281,8 +535,8 @@ func TestShapeHashIgnoresLiveValues(t *testing.T) {
 	off := `{"id":"d","name":"L","type":"devices.types.light","capabilities":[
 	         {"type":"devices.capabilities.on_off","retrievable":true,"state":{"instance":"on","value":false}}]}`
 
-	a, _ := BuildSpec(device(t, on), config.DeviceOverride{})
-	b, _ := BuildSpec(device(t, off), config.DeviceOverride{})
+	a, _, _ := buildSpec(t, on, config.DeviceOverride{})
+	b, _, _ := buildSpec(t, off, config.DeviceOverride{})
 
 	// Turning a lamp on must never look like a structural change; if it did,
 	// the supervisor would rebuild the HAP server every time somebody used a
@@ -297,13 +551,13 @@ func TestTopologyHashIgnoresDeviceOrder(t *testing.T) {
 	socket := device(t, `{"id":"socket","name":"S","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`)
 
 	cfg := config.Defaults()
-	forward := TopologyHash(BuildSpecs([]yandex.Device{lamp, socket}, cfg))
-	reverse := TopologyHash(BuildSpecs([]yandex.Device{socket, lamp}, cfg))
+	forwardSpecs, _ := BuildSpecs(home(lamp, socket), cfg)
+	reverseSpecs, _ := BuildSpecs(home(socket, lamp), cfg)
 
 	// Yandex is under no obligation to keep its ordering stable, and a
 	// reorder must never be mistaken for a topology change.
-	if forward != reverse {
-		t.Errorf("TopologyHash depends on order: %s vs %s", forward, reverse)
+	if TopologyHash(forwardSpecs) != TopologyHash(reverseSpecs) {
+		t.Error("TopologyHash depends on device order")
 	}
 }
 
@@ -312,37 +566,49 @@ func TestTopologyHashDetectsAddedAndRemovedDevices(t *testing.T) {
 	socket := device(t, `{"id":"socket","name":"S","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`)
 
 	cfg := config.Defaults()
-	one := TopologyHash(BuildSpecs([]yandex.Device{lamp}, cfg))
-	two := TopologyHash(BuildSpecs([]yandex.Device{lamp, socket}, cfg))
+	one, _ := BuildSpecs(home(lamp), cfg)
+	two, _ := BuildSpecs(home(lamp, socket), cfg)
 
-	if one == two {
+	if TopologyHash(one) == TopologyHash(two) {
 		t.Error("TopologyHash did not change when a device was added")
 	}
 }
 
-func TestBuildSpecsSkipsExcluded(t *testing.T) {
+func TestBuildSpecsSkipsExcludedButStillReportsIt(t *testing.T) {
 	lamp := device(t, `{"id":"lamp","name":"L","type":"devices.types.light","capabilities":[`+onOffCap+`]}`)
 	socket := device(t, `{"id":"socket","name":"S","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`)
 
 	cfg := config.Defaults()
 	cfg.Devices = map[string]config.DeviceOverride{"socket": {Exclude: true}}
 
-	specs := BuildSpecs([]yandex.Device{lamp, socket}, cfg)
+	specs, reports := BuildSpecs(home(lamp, socket), cfg)
 	if len(specs) != 1 || specs[0].DeviceID != "lamp" {
 		t.Errorf("specs = %+v, want only the lamp", specs)
 	}
-}
-
-func jsonf(format string, args ...any) string {
-	b, _ := json.Marshal(args[0])
-	return replaceFirst(format, "%q", string(b))
-}
-
-func replaceFirst(s, old, new string) string {
-	for i := 0; i+len(old) <= len(s); i++ {
-		if s[i:i+len(old)] == old {
-			return s[:i] + new + s[i+len(old):]
-		}
+	// The report covers every device, so an excluded one does not simply
+	// vanish from the inventory.
+	if len(reports) != 2 {
+		t.Errorf("reports = %d, want one per device", len(reports))
 	}
-	return s
+	if !slices.ContainsFunc(reports, func(r MappingReport) bool {
+		return r.DeviceID == "socket" && r.Skipped
+	}) {
+		t.Error("the excluded device is missing from the report")
+	}
+}
+
+func TestBuildSpecsResolvesRoomNames(t *testing.T) {
+	lamp := device(t, `{"id":"lamp","name":"L","type":"devices.types.light","room":"r1","capabilities":[`+onOffCap+`]}`)
+	info := &yandex.UserInfo{
+		Rooms:   []yandex.Room{{ID: "r1", Name: "Гостиная"}},
+		Devices: []yandex.Device{lamp},
+	}
+
+	specs, reports := BuildSpecs(info, config.Defaults())
+	if len(specs) != 1 || specs[0].Room != "Гостиная" {
+		t.Errorf("spec room = %q, want Гостиная", specs[0].Room)
+	}
+	if reports[0].Room != "Гостиная" {
+		t.Errorf("report room = %q, want Гостиная", reports[0].Room)
+	}
 }

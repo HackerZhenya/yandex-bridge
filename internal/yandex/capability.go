@@ -97,6 +97,55 @@ func (c Capability) OnOffState() (bool, error) {
 	return s.Value, nil
 }
 
+// ToggleInstance decodes which two-state function a toggle capability
+// controls: backlight, keep_warm, ionization and so on.
+func (c Capability) ToggleInstance() (string, error) {
+	if c.Type != CapabilityToggle {
+		return "", fmt.Errorf("capability is %s, not toggle", c.Type)
+	}
+	if rawOrNull(c.Parameters) {
+		return "", fmt.Errorf("toggle capability has no parameters")
+	}
+	var p struct {
+		Instance string `json:"instance"`
+	}
+	if err := json.Unmarshal(c.Parameters, &p); err != nil {
+		return "", fmt.Errorf("decode toggle parameters: %w", err)
+	}
+	return p.Instance, nil
+}
+
+// ToggleState decodes the current value of a toggle capability.
+func (c Capability) ToggleState() (bool, error) {
+	if c.Type != CapabilityToggle {
+		return false, fmt.Errorf("capability is %s, not toggle", c.Type)
+	}
+	if rawOrNull(c.State) {
+		return false, ErrNoState
+	}
+	var s struct {
+		Instance string `json:"instance"`
+		Value    bool   `json:"value"`
+	}
+	if err := json.Unmarshal(c.State, &s); err != nil {
+		return false, fmt.Errorf("decode toggle state: %w", err)
+	}
+	return s.Value, nil
+}
+
+// ToggleCapability finds the toggle capability for a given instance.
+func (d Device) ToggleCapability(instance string) (Capability, bool) {
+	for _, c := range d.Capabilities {
+		if c.Type != CapabilityToggle {
+			continue
+		}
+		if got, err := c.ToggleInstance(); err == nil && got == instance {
+			return c, true
+		}
+	}
+	return Capability{}, false
+}
+
 // Range describes the accepted values of a range capability.
 type Range struct {
 	Min       float64 `json:"min"`

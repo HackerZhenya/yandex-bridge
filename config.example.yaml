@@ -4,6 +4,11 @@
 # Yandex account, which is the intended way to run it. This file exists to hide,
 # rename or re-shape individual devices.
 #
+# To find a device id, ask the bridge:
+#     curl -s http://raspberrypi.local:8080/devices | jq
+# The same inventory goes into the logs at startup and whenever the device set
+# changes, including which capabilities the bridge could not map.
+#
 # Secrets are NOT read from here — they come from the environment:
 #   YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET, HOMEKIT_PIN
 
@@ -18,6 +23,20 @@ poll_interval: 15s
 confirm_window: 5s
 confirm_interval: 1s
 
+# How long a value written from HomeKit is protected from being overwritten by
+# a poll that has not caught up yet. Without this the colour picker jumps back
+# under your finger: Yandex keeps reporting the old colour for a second or
+# three, and HomeKit broadcasts whatever the bridge writes back to the phone
+# that is mid-drag. Raise it if your devices are slow to report; lower it if a
+# change made in the Yandex app takes too long to appear.
+settle_window: 10s
+
+# How long writes are buffered before being sent as one request. HomeKit sends
+# hue and saturation together in a single request but hands them over one at a
+# time, so without this a colour change becomes two Yandex calls — the first
+# carrying a stale component, which the light briefly displays.
+coalesce_delay: 60ms
+
 # How many consecutive successful polls must agree that the device list changed
 # before the HomeKit bridge is rebuilt. Raising it makes the bridge more
 # stubborn about partial API responses; lowering it makes new devices appear
@@ -27,6 +46,11 @@ topology_confirmations: 3
 # How many consecutive failed polls mark accessories "Not Responding" and trip
 # the Bridge Health sensor.
 unhealthy_after: 4
+
+# Export devices.capabilities.toggle (keep_warm, backlight, ionization, ...) as
+# extra switches inside the same accessory. Set to false to leave them out
+# everywhere; use hide_toggles below to drop individual ones.
+expose_toggles: true
 
 log_level: info
 health_addr: ":8080"
@@ -39,15 +63,32 @@ homekit:
   interfaces:
     - eth0
 
-# Per-device overrides, keyed by the Yandex device id. The id is in the logs at
-# debug level, and in the /healthz output is the device count only — the easiest
-# way to find one is `LOG_LEVEL=debug` on the first run.
+health:
+  # The Bridge Health accessory. Turning it off keeps /healthz, the logs and
+  # "Not Responding" on devices, but gives up push notifications about a dead
+  # token — which is the one failure nothing else will tell you about.
+  enabled: true
+  # The switch that restarts Yandex authorization. It rests in the *on*
+  # position; turning it off asks for re-authorization and it springs back.
+  reauth_button: true
+
+# Per-device overrides, keyed by the Yandex device id.
 devices:
   # A dumb fan plugged into a smart socket: present it to HomeKit as a fan
   # rather than an outlet, so Siri and the Home app treat it as one.
   "socket-id-goes-here":
-    type: fan                     # lightbulb | outlet | switch | fan
+    type: fan                     # lightbulb | outlet | switch | fan | thermostat
     name: "Вентилятор в спальне"
+
+  # A kettle is detected automatically and exported as a thermostat: one tile
+  # with on/off, a target temperature and the current reading. Force "switch"
+  # to get the older shape instead — a plain switch plus a separate temperature
+  # sensor. (The Home app can also split any accessory's services into separate
+  # tiles from the tile's own settings.)
+  "kettle-id-goes-here":
+    type: switch
+    hide_toggles:
+      - backlight                 # keep the keep_warm switch, drop the light
 
   # A lamp that supports both colour and white temperature. HomeKit gets
   # confused when a light exposes both, so the bridge picks one: colour by

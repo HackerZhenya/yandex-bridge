@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/brutella/hap"
 	"github.com/brutella/hap/accessory"
@@ -18,6 +21,22 @@ import (
 // Manufacturer shown in the Home app's accessory details.
 const manufacturer = "Yandex Smart Home"
 
+// Write keys. A key names a group of characteristics that turn into one
+// Yandex action, so that hue and saturation cannot be sent separately.
+const (
+	writeOnOff      = "on_off"
+	writeBrightness = "brightness"
+	writeColor      = "color"
+	writeTarget     = "target_temp"
+	writeTogglePfx  = "toggle:"
+)
+
+// HomeKit heating/cooling states used by the Thermostat service.
+const (
+	heatingStateOff  = 0
+	heatingStateHeat = 1
+)
+
 // Controller applies HomeKit writes to Yandex and reports whether the bridge
 // can currently reach it.
 type Controller interface {
@@ -25,6 +44,14 @@ type Controller interface {
 	Apply(ctx context.Context, deviceID string, actions []yandex.Action) error
 	// Reachable reports whether the last interaction with Yandex succeeded.
 	Reachable() bool
+}
+
+// expectation is a value written from HomeKit that Yandex has not confirmed
+// yet. Until it does — or the deadline passes — polled state for that
+// characteristic is ignored.
+type expectation struct {
+	value any
+	until time.Time
 }
 
 // Accessory is one Yandex device exposed to HomeKit, together with the
@@ -39,16 +66,40 @@ type Accessory struct {
 	saturation *characteristic.Saturation
 	colorTemp  *characteristic.ColorTemperature
 
+	targetState *characteristic.TargetHeatingCoolingState
+	currentHeat *characteristic.CurrentHeatingCoolingState
+	targetTemp  *characteristic.TargetTemperature
+	currentTemp *characteristic.CurrentTemperature
+
 	temperature *characteristic.CurrentTemperature
 	humidity    *characteristic.CurrentRelativeHumidity
 	battery     *service.BatteryService
+	toggles     map[string]*characteristic.On
 
 	// offline mirrors the device's own state as reported by Yandex, which is
 	// separate from whether the bridge can reach Yandex at all.
 	offline atomic.Bool
 
+	// writeMu guards the coalescing buffer.
+	writeMu    sync.Mutex
+	writeDirty map[string]struct{}
+	writeSched bool
+
+	// expectMu guards the echo-suppression map.
+	expectMu sync.Mutex
+	expect   map[*characteristic.C]expectation
+
+	coalesceDelay time.Duration
+	settleWindow  time.Duration
+
 	ctrl   Controller
 	logger *slog.Logger
+}
+
+// BuildOptions carries the tunables an accessory needs.
+type BuildOptions struct {
+	CoalesceDelay time.Duration
+	SettleWindow  time.Duration
 }
 
 // BuildAccessory constructs the HomeKit accessory for a spec.
@@ -57,8 +108,20 @@ type Accessory struct {
 // from live values — because hap assigns instance ids by position. A layout
 // that varied with the current state would renumber characteristics under a
 // paired controller.
-func BuildAccessory(spec Spec, aid uint64, ctrl Controller, logger *slog.Logger) *Accessory {
-	a := &Accessory{Spec: spec, ctrl: ctrl, logger: logger}
+func BuildAccessory(spec Spec, aid uint64, ctrl Controller, opts BuildOptions, logger *slog.Logger) *Accessory {
+	a := &Accessory{
+		Spec:          spec,
+		ctrl:          ctrl,
+		logger:        logger,
+		writeDirty:    make(map[string]struct{}),
+		expect:        make(map[*characteristic.C]expectation),
+		toggles:       make(map[string]*characteristic.On),
+		coalesceDelay: opts.CoalesceDelay,
+		settleWindow:  opts.SettleWindow,
+	}
+	if a.coalesceDelay <= 0 {
+		a.coalesceDelay = 60 * time.Millisecond
+	}
 
 	a.A = accessory.New(accessory.Info{
 		Name:         spec.Name,
@@ -71,6 +134,7 @@ func BuildAccessory(spec Spec, aid uint64, ctrl Controller, logger *slog.Logger)
 
 	a.addPrimaryService()
 	a.addSensorServices()
+	a.addToggleServices()
 	return a
 }
 
@@ -84,6 +148,8 @@ func accessoryTypeFor(k Kind) byte {
 		return accessory.TypeSwitch
 	case KindFan:
 		return accessory.TypeFan
+	case KindThermostat:
+		return accessory.TypeThermostat
 	default:
 		return accessory.TypeSensor
 	}
@@ -91,6 +157,8 @@ func accessoryTypeFor(k Kind) byte {
 
 // addPrimaryService adds the switchable service, if the device has one.
 func (a *Accessory) addPrimaryService() {
+	var primary *service.S
+
 	switch a.Spec.Kind {
 	case KindLightbulb:
 		s := service.New(service.TypeLightbulb)
@@ -118,7 +186,7 @@ func (a *Accessory) addPrimaryService() {
 			}
 			s.AddC(a.colorTemp.C)
 		}
-		a.A.AddS(s)
+		primary = s
 
 	case KindOutlet:
 		s := service.NewOutlet()
@@ -126,43 +194,106 @@ func (a *Accessory) addPrimaryService() {
 		// The bridge cannot tell whether something is plugged in, so mirror
 		// the switch state rather than claim knowledge it does not have.
 		s.OutletInUse.SetValue(true)
-		a.A.AddS(s.S)
+		primary = s.S
 
 	case KindSwitch:
 		s := service.NewSwitch()
 		a.on = s.On
-		a.A.AddS(s.S)
+		primary = s.S
 
 	case KindFan:
 		// Service type Fan (not FanV2) gives a single on/off control, which
 		// is all a dumb fan on a smart socket can honestly offer.
 		s := service.NewFan()
 		a.on = s.On
-		a.A.AddS(s.S)
+		primary = s.S
+
+	case KindThermostat:
+		primary = a.buildThermostat()
 
 	case KindSensor:
 		// Readings only; the sensor services are added below.
 	}
 
+	if primary != nil {
+		// Marks which control the Home app shows on the collapsed tile, so a
+		// toggle cannot end up standing in for the device itself.
+		primary.Primary = true
+		a.A.AddS(primary)
+	}
+
+	a.wirePrimaryHandlers()
+}
+
+// buildThermostat maps a device that heats to a temperature.
+//
+// Thermostat is used rather than HeaterCooler because its characteristics say
+// what the device actually does: TargetHeatingCoolingState is a two-state
+// control that maps onto on_off, and TargetTemperature is a target rather than
+// a threshold of a deadband.
+func (a *Accessory) buildThermostat() *service.S {
+	s := service.NewThermostat()
+
+	// The device only heats, so Cool and Auto would be dead options.
+	s.TargetHeatingCoolingState.ValidVals = []int{heatingStateOff, heatingStateHeat}
+	s.CurrentHeatingCoolingState.ValidVals = []int{heatingStateOff, heatingStateHeat}
+	a.targetState = s.TargetHeatingCoolingState
+	a.currentHeat = s.CurrentHeatingCoolingState
+
+	// Celsius. Yandex reports temperatures in Celsius and this only affects
+	// what the accessory says its own units are.
+	_ = s.TemperatureDisplayUnits.SetValue(0)
+
+	a.currentTemp = s.CurrentTemperature
+	a.currentTemp.SetMinValue(-100)
+	a.currentTemp.SetMaxValue(150)
+
+	a.targetTemp = s.TargetTemperature
+	if t := a.Spec.Target; t != nil {
+		// HAP defines TargetTemperature as 10-38 °C, which no kettle fits in.
+		// The Home app takes the bounds from the accessory's own metadata, so
+		// widening them here is what makes 40-100 °C selectable.
+		a.targetTemp.SetMinValue(t.Min)
+		a.targetTemp.SetMaxValue(t.Max)
+		a.targetTemp.SetStepValue(t.Precision)
+		a.targetTemp.SetValue(t.Min)
+	}
+	return s.S
+}
+
+// wirePrimaryHandlers connects the writable characteristics to the coalescing
+// buffer and the readable ones to the reachability guard.
+func (a *Accessory) wirePrimaryHandlers() {
 	if a.on != nil {
-		a.on.OnSetRemoteValue(a.setOn)
+		a.on.OnSetRemoteValue(func(bool) error { a.queueWrite(writeOnOff); return nil })
 		a.on.ValueRequestFunc = a.readGuard(func() any { return a.on.Value() })
 	}
 	if a.brightness != nil {
-		a.brightness.OnSetRemoteValue(a.setBrightness)
+		a.brightness.OnSetRemoteValue(func(int) error { a.queueWrite(writeBrightness); return nil })
 		a.brightness.ValueRequestFunc = a.readGuard(func() any { return a.brightness.Value() })
 	}
 	if a.hue != nil {
-		a.hue.OnSetRemoteValue(func(v float64) error { return a.setHueSaturation(v, a.saturation.Value()) })
+		a.hue.OnSetRemoteValue(func(float64) error { a.queueWrite(writeColor); return nil })
 		a.hue.ValueRequestFunc = a.readGuard(func() any { return a.hue.Value() })
 	}
 	if a.saturation != nil {
-		a.saturation.OnSetRemoteValue(func(v float64) error { return a.setHueSaturation(a.hue.Value(), v) })
+		a.saturation.OnSetRemoteValue(func(float64) error { a.queueWrite(writeColor); return nil })
 		a.saturation.ValueRequestFunc = a.readGuard(func() any { return a.saturation.Value() })
 	}
 	if a.colorTemp != nil {
-		a.colorTemp.OnSetRemoteValue(a.setColorTemperature)
+		a.colorTemp.OnSetRemoteValue(func(int) error { a.queueWrite(writeColor); return nil })
 		a.colorTemp.ValueRequestFunc = a.readGuard(func() any { return a.colorTemp.Value() })
+	}
+	if a.targetState != nil {
+		a.targetState.OnSetRemoteValue(func(int) error { a.queueWrite(writeOnOff); return nil })
+		a.targetState.ValueRequestFunc = a.readGuard(func() any { return a.targetState.Value() })
+	}
+	if a.targetTemp != nil {
+		a.targetTemp.OnSetRemoteValue(func(float64) error { a.queueWrite(writeTarget); return nil })
+		a.targetTemp.ValueRequestFunc = a.readGuard(func() any { return a.targetTemp.Value() })
+	}
+	if a.currentTemp != nil {
+		a.currentTemp.ValueRequestFunc = a.readGuard(func() any { return a.currentTemp.Value() })
 	}
 }
 
@@ -195,6 +326,29 @@ func (a *Accessory) addSensorServices() {
 	}
 }
 
+// addToggleServices exposes each toggle capability as its own switch inside
+// the same accessory. The Home app groups an accessory's services into one
+// tile by default, so these land in the device's own card rather than
+// scattering across the Home screen.
+func (a *Accessory) addToggleServices() {
+	for _, t := range a.Spec.Toggles {
+		s := service.NewSwitch()
+
+		// Without a Name characteristic every switch would show the
+		// accessory's own name and be indistinguishable from its siblings.
+		name := characteristic.NewName()
+		name.SetValue(t.Name)
+		s.AddC(name.C)
+
+		instance := t.Instance
+		s.On.OnSetRemoteValue(func(bool) error { a.queueWrite(writeTogglePfx + instance); return nil })
+		s.On.ValueRequestFunc = a.readGuard(func() any { return s.On.Value() })
+
+		a.toggles[instance] = s.On
+		a.A.AddS(s.S)
+	}
+}
+
 // readGuard wraps a characteristic read so that an unreachable device or an
 // unreachable Yandex surfaces in HomeKit as "Not Responding" instead of a
 // stale value presented as current.
@@ -206,6 +360,277 @@ func (a *Accessory) readGuard(read func() any) func(*http.Request) (any, int) {
 		return read(), 0
 	}
 }
+
+// --- write path ---
+
+// queueWrite marks a group of characteristics as changed and schedules a flush.
+//
+// Writes are buffered rather than sent immediately for two reasons. HomeKit
+// sends hue and saturation in a single request and hap hands them over one
+// characteristic at a time, so sending on each one would mean two Yandex calls
+// per colour change — and the first would carry a stale component, because
+// hap updates the stored value only after the setter returns. Buffering also
+// collapses the flood of updates a colour picker produces while being dragged.
+func (a *Accessory) queueWrite(key string) {
+	a.writeMu.Lock()
+	a.writeDirty[key] = struct{}{}
+	if a.writeSched {
+		a.writeMu.Unlock()
+		return
+	}
+	a.writeSched = true
+	a.writeMu.Unlock()
+
+	time.AfterFunc(a.coalesceDelay, a.flush)
+}
+
+// flush sends every buffered change as a single Yandex request.
+//
+// At most one request per accessory is in flight: anything that arrives while
+// one is running is collected and sent immediately afterwards. That keeps the
+// bridge from queueing up seconds of stale writes during a drag without
+// needing a separate rate limiter.
+func (a *Accessory) flush() {
+	a.writeMu.Lock()
+	dirty := a.writeDirty
+	a.writeDirty = make(map[string]struct{})
+	a.writeMu.Unlock()
+
+	if len(dirty) > 0 {
+		a.send(dirty)
+	}
+
+	a.writeMu.Lock()
+	more := len(a.writeDirty) > 0
+	a.writeSched = more
+	a.writeMu.Unlock()
+
+	if more {
+		time.AfterFunc(a.coalesceDelay, a.flush)
+	}
+}
+
+// send builds one action list from the dirty keys and applies it.
+func (a *Accessory) send(dirty map[string]struct{}) {
+	actions, written := a.buildActions(dirty)
+	if len(actions) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
+
+	if err := a.ctrl.Apply(ctx, a.Spec.DeviceID, actions); err != nil {
+		// Drop any expectations so the next poll immediately puts the real
+		// state back into HomeKit rather than leaving the failed value on
+		// screen for the whole settle window.
+		a.clearExpectations()
+		a.logger.Warn("failed to apply HomeKit change",
+			slog.String("device_id", a.Spec.DeviceID),
+			slog.String("device", a.Spec.Name),
+			slog.Int("actions", len(actions)),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	a.recordExpectations(written)
+	a.logger.Debug("applied HomeKit change",
+		slog.String("device", a.Spec.Name),
+		slog.Any("actions", actions))
+}
+
+// buildActions turns dirty keys into Yandex actions, reading the current
+// characteristic values. By the time this runs hap has committed every value
+// from the originating request, which is what makes a colour change carry the
+// correct hue and saturation together.
+func (a *Accessory) buildActions(dirty map[string]struct{}) ([]yandex.Action, []*characteristic.C) {
+	var (
+		actions []yandex.Action
+		written []*characteristic.C
+	)
+
+	if _, ok := dirty[writeOnOff]; ok {
+		switch {
+		case a.on != nil:
+			actions = append(actions, yandex.Action{
+				Type:  yandex.CapabilityOnOff,
+				State: yandex.ActionState{Instance: "on", Value: a.on.Value()},
+			})
+			written = append(written, a.on.C)
+		case a.targetState != nil:
+			on := a.targetState.Value() != heatingStateOff
+			actions = append(actions, yandex.Action{
+				Type:  yandex.CapabilityOnOff,
+				State: yandex.ActionState{Instance: "on", Value: on},
+			})
+			written = append(written, a.targetState.C)
+		}
+	}
+
+	// Brightness reaches the device through its own range capability when it
+	// has one, and otherwise as the value component of the colour.
+	_, wantBrightness := dirty[writeBrightness]
+	if wantBrightness && a.brightness != nil && a.Spec.Brightness != nil {
+		actions = append(actions, yandex.Action{
+			Type: yandex.CapabilityRange,
+			State: yandex.ActionState{
+				Instance: string(yandex.RangeBrightness),
+				Value:    a.percentToBrightness(a.brightness.Value()),
+			},
+		})
+		written = append(written, a.brightness.C)
+		wantBrightness = false
+	}
+
+	_, wantColor := dirty[writeColor]
+	if wantColor || wantBrightness {
+		switch {
+		case a.hue != nil:
+			value := float64(100)
+			if a.brightness != nil {
+				value = float64(a.brightness.Value())
+			}
+			actions = append(actions, yandex.Action{
+				Type: yandex.CapabilityColorSetting,
+				State: yandex.ActionState{
+					Instance: string(yandex.ColorHSV),
+					Value: map[string]float64{
+						"h": math.Round(a.hue.Value()),
+						"s": math.Round(a.saturation.Value()),
+						"v": math.Round(value),
+					},
+				},
+			})
+			written = append(written, a.hue.C, a.saturation.C)
+			if a.brightness != nil {
+				written = append(written, a.brightness.C)
+			}
+
+		case a.colorTemp != nil && wantColor:
+			kelvin := miredToKelvin(a.colorTemp.Value())
+			if k := a.Spec.Kelvin; k != nil {
+				kelvin = clampFloat(kelvin, k.Min, k.Max)
+			}
+			actions = append(actions, yandex.Action{
+				Type: yandex.CapabilityColorSetting,
+				State: yandex.ActionState{
+					Instance: string(yandex.ColorTemperatureK),
+					Value:    int(math.Round(kelvin)),
+				},
+			})
+			written = append(written, a.colorTemp.C)
+		}
+	}
+
+	if _, ok := dirty[writeTarget]; ok && a.targetTemp != nil {
+		value := a.targetTemp.Value()
+		if t := a.Spec.Target; t != nil {
+			value = clampFloat(value, t.Min, t.Max)
+		}
+		actions = append(actions, yandex.Action{
+			Type: yandex.CapabilityRange,
+			State: yandex.ActionState{
+				Instance: string(yandex.RangeTemperature),
+				Value:    value,
+			},
+		})
+		written = append(written, a.targetTemp.C)
+	}
+
+	for key := range dirty {
+		instance, ok := strings.CutPrefix(key, writeTogglePfx)
+		if !ok {
+			continue
+		}
+		c, known := a.toggles[instance]
+		if !known {
+			continue
+		}
+		actions = append(actions, yandex.Action{
+			Type:  yandex.CapabilityToggle,
+			State: yandex.ActionState{Instance: instance, Value: c.Value()},
+		})
+		written = append(written, c.C)
+	}
+
+	return actions, written
+}
+
+// --- echo suppression ---
+
+// recordExpectations remembers what was just written, so that state polled
+// before Yandex catches up does not overwrite it.
+func (a *Accessory) recordExpectations(cs []*characteristic.C) {
+	if a.settleWindow <= 0 {
+		return
+	}
+	until := time.Now().Add(a.settleWindow)
+
+	a.expectMu.Lock()
+	defer a.expectMu.Unlock()
+	for _, c := range cs {
+		a.expect[c] = expectation{value: c.Value(), until: until}
+	}
+}
+
+// clearExpectations forgets every pending write, letting polled state win.
+func (a *Accessory) clearExpectations() {
+	a.expectMu.Lock()
+	defer a.expectMu.Unlock()
+	clear(a.expect)
+}
+
+// suppressed reports whether an incoming value should be ignored because it
+// contradicts a write that Yandex has not confirmed yet.
+//
+// This is what stops the colour picker from jumping back under the user's
+// finger: Yandex reaches the device through the vendor's cloud, so for a
+// second or three it keeps reporting the old colour, and hap broadcasts any
+// value the bridge writes to every connected controller — including the phone
+// that is mid-drag.
+func (a *Accessory) suppressed(c *characteristic.C, incoming any) bool {
+	a.expectMu.Lock()
+	defer a.expectMu.Unlock()
+
+	e, ok := a.expect[c]
+	if !ok {
+		return false
+	}
+	if time.Now().After(e.until) {
+		// Yandex never converged; stop arguing and accept reality.
+		delete(a.expect, c)
+		return false
+	}
+	if valuesEqual(e.value, incoming) {
+		delete(a.expect, c)
+		return false
+	}
+	return true
+}
+
+// valuesEqual compares characteristic values, tolerating the int/float mix
+// that comes from HomeKit integers and Yandex floats.
+func valuesEqual(a, b any) bool {
+	af, aok := toFloat(a)
+	bf, bok := toFloat(b)
+	if aok && bok {
+		return math.Abs(af-bf) < 0.001
+	}
+	return a == b
+}
+
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case float64:
+		return n, true
+	default:
+		return 0, false
+	}
+}
+
+// --- read path ---
 
 // Apply pushes a Yandex device state into the HomeKit characteristics.
 //
@@ -219,21 +644,47 @@ func (a *Accessory) Apply(dev yandex.Device) {
 		a.offline.Store(dev.State.Offline())
 	}
 
-	if a.on != nil {
-		if cap, ok := dev.Capability(yandex.CapabilityOnOff); ok {
-			if on, err := cap.OnOffState(); err == nil && on != a.on.Value() {
-				a.on.SetValue(on)
-			}
-		}
-	}
-
+	a.applyOnOff(dev)
 	if a.brightness != nil {
 		a.applyBrightness(dev)
 	}
 	if a.hue != nil || a.colorTemp != nil {
 		a.applyColor(dev)
 	}
+	if a.targetTemp != nil {
+		a.applyTargetTemperature(dev)
+	}
+	a.applyToggles(dev)
 	a.applySensors(dev)
+}
+
+func (a *Accessory) applyOnOff(dev yandex.Device) {
+	cap, ok := dev.Capability(yandex.CapabilityOnOff)
+	if !ok {
+		return
+	}
+	on, err := cap.OnOffState()
+	if err != nil {
+		return
+	}
+
+	if a.on != nil && !a.suppressed(a.on.C, on) && on != a.on.Value() {
+		a.on.SetValue(on)
+	}
+
+	if a.targetState != nil {
+		state := heatingStateOff
+		if on {
+			state = heatingStateHeat
+		}
+		if !a.suppressed(a.targetState.C, state) && state != a.targetState.Value() {
+			_ = a.targetState.SetValue(state)
+		}
+		// CurrentHeatingCoolingState is read-only, so it simply follows.
+		if state != a.currentHeat.Value() {
+			_ = a.currentHeat.SetValue(state)
+		}
+	}
 }
 
 func (a *Accessory) applyBrightness(dev yandex.Device) {
@@ -245,7 +696,8 @@ func (a *Accessory) applyBrightness(dev yandex.Device) {
 	if err != nil {
 		return
 	}
-	if pct := a.brightnessToPercent(value); pct != a.brightness.Value() {
+	pct := a.brightnessToPercent(value)
+	if !a.suppressed(a.brightness.C, pct) && pct != a.brightness.Value() {
 		_ = a.brightness.SetValue(pct)
 	}
 }
@@ -265,10 +717,10 @@ func (a *Accessory) applyColor(dev yandex.Device) {
 		if a.hue == nil {
 			return
 		}
-		if state.HSV.H != a.hue.Value() {
+		if !a.suppressed(a.hue.C, state.HSV.H) && state.HSV.H != a.hue.Value() {
 			a.hue.SetValue(state.HSV.H)
 		}
-		if state.HSV.S != a.saturation.Value() {
+		if !a.suppressed(a.saturation.C, state.HSV.S) && state.HSV.S != a.saturation.Value() {
 			a.saturation.SetValue(state.HSV.S)
 		}
 
@@ -277,18 +729,58 @@ func (a *Accessory) applyColor(dev yandex.Device) {
 			// The device is in white mode but HomeKit is showing hue and
 			// saturation; report white as a fully desaturated colour so the
 			// two views agree.
-			if a.saturation != nil && a.saturation.Value() != 0 {
+			if a.saturation != nil && !a.suppressed(a.saturation.C, float64(0)) && a.saturation.Value() != 0 {
 				a.saturation.SetValue(0)
 			}
 			return
 		}
-		if mired := kelvinToMired(state.TemperatureK); mired != a.colorTemp.Value() {
+		mired := kelvinToMired(state.TemperatureK)
+		if !a.suppressed(a.colorTemp.C, mired) && mired != a.colorTemp.Value() {
 			_ = a.colorTemp.SetValue(mired)
 		}
 	}
 }
 
+func (a *Accessory) applyTargetTemperature(dev yandex.Device) {
+	cap, ok := dev.RangeCapability(yandex.RangeTemperature)
+	if !ok {
+		return
+	}
+	_, value, err := cap.RangeState()
+	if err != nil {
+		return
+	}
+	if !a.suppressed(a.targetTemp.C, value) && value != a.targetTemp.Value() {
+		a.targetTemp.SetValue(value)
+	}
+}
+
+func (a *Accessory) applyToggles(dev yandex.Device) {
+	for instance, c := range a.toggles {
+		cap, ok := dev.ToggleCapability(instance)
+		if !ok {
+			continue
+		}
+		on, err := cap.ToggleState()
+		if err != nil {
+			continue
+		}
+		if !a.suppressed(c.C, on) && on != c.Value() {
+			c.SetValue(on)
+		}
+	}
+}
+
+// applySensors pushes read-only readings. They are never suppressed: nothing
+// writes them from HomeKit, so there is no echo to guard against.
 func (a *Accessory) applySensors(dev yandex.Device) {
+	if target := a.currentTemp; target != nil {
+		if p, ok := dev.FloatProperty(yandex.FloatTemperature); ok {
+			if v, err := p.FloatState(); err == nil && v != target.Value() {
+				target.SetValue(v)
+			}
+		}
+	}
 	if a.temperature != nil {
 		if p, ok := dev.FloatProperty(yandex.FloatTemperature); ok {
 			if v, err := p.FloatState(); err == nil && v != a.temperature.Value() {
@@ -328,90 +820,6 @@ func (a *Accessory) SetUnreachable(unreachable bool) { a.offline.Store(unreachab
 
 // Offline reports the accessory's current reachability.
 func (a *Accessory) Offline() bool { return a.offline.Load() }
-
-// --- write path ---
-
-func (a *Accessory) setOn(on bool) error {
-	return a.apply(yandex.Action{
-		Type:  yandex.CapabilityOnOff,
-		State: yandex.ActionState{Instance: "on", Value: on},
-	})
-}
-
-func (a *Accessory) setBrightness(pct int) error {
-	// A device with a brightness range takes brightness through it; one with
-	// only colour support carries brightness in the HSV value component.
-	if a.Spec.Brightness != nil {
-		return a.apply(yandex.Action{
-			Type:  yandex.CapabilityRange,
-			State: yandex.ActionState{Instance: string(yandex.RangeBrightness), Value: a.percentToBrightness(pct)},
-		})
-	}
-	if a.hue != nil {
-		return a.setHSV(a.hue.Value(), a.saturation.Value(), float64(pct))
-	}
-	return nil
-}
-
-func (a *Accessory) setHueSaturation(hue, saturation float64) error {
-	value := float64(100)
-	if a.brightness != nil {
-		value = float64(a.brightness.Value())
-	}
-	return a.setHSV(hue, saturation, value)
-}
-
-func (a *Accessory) setHSV(hue, saturation, value float64) error {
-	return a.apply(yandex.Action{
-		Type: yandex.CapabilityColorSetting,
-		State: yandex.ActionState{
-			Instance: string(yandex.ColorHSV),
-			Value: map[string]float64{
-				"h": math.Round(hue),
-				"s": math.Round(saturation),
-				"v": math.Round(value),
-			},
-		},
-	})
-}
-
-func (a *Accessory) setColorTemperature(mired int) error {
-	kelvin := miredToKelvin(mired)
-	if k := a.Spec.Kelvin; k != nil {
-		kelvin = clampFloat(kelvin, k.Min, k.Max)
-	}
-	return a.apply(yandex.Action{
-		Type: yandex.CapabilityColorSetting,
-		State: yandex.ActionState{
-			Instance: string(yandex.ColorTemperatureK),
-			Value:    int(math.Round(kelvin)),
-		},
-	})
-}
-
-// apply sends one action and reports failure to HomeKit. Returning an error
-// makes hap answer with -70402, which the Home app shows as the accessory
-// failing rather than silently ignoring the tap.
-func (a *Accessory) apply(action yandex.Action) error {
-	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-	defer cancel()
-
-	if err := a.ctrl.Apply(ctx, a.Spec.DeviceID, []yandex.Action{action}); err != nil {
-		a.logger.Warn("failed to apply HomeKit change",
-			slog.String("device_id", a.Spec.DeviceID),
-			slog.String("device", a.Spec.Name),
-			slog.String("capability", string(action.Type)),
-			slog.String("instance", action.State.Instance),
-			slog.String("error", err.Error()))
-		return err
-	}
-	a.logger.Debug("applied HomeKit change",
-		slog.String("device", a.Spec.Name),
-		slog.String("capability", string(action.Type)),
-		slog.String("instance", action.State.Instance),
-		slog.Any("value", action.State.Value))
-	return nil
-}
 
 // --- unit conversions ---
 

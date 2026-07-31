@@ -46,6 +46,25 @@ type Supervisor struct {
 	// rebuild carries a confirmed new accessory set to the run loop. It holds
 	// one entry: a newer set always supersedes an older one.
 	rebuild chan []Spec
+
+	// inventory is the latest mapping report, served over HTTP so device ids
+	// can be looked up without grepping the logs.
+	inventoryMu sync.RWMutex
+	inventory   []MappingReport
+}
+
+// setInventory stores the latest mapping report.
+func (s *Supervisor) setInventory(reports []MappingReport) {
+	s.inventoryMu.Lock()
+	defer s.inventoryMu.Unlock()
+	s.inventory = reports
+}
+
+// Inventory returns the latest mapping report, for the /devices endpoint.
+func (s *Supervisor) Inventory() []MappingReport {
+	s.inventoryMu.RLock()
+	defer s.inventoryMu.RUnlock()
+	return slices.Clone(s.inventory)
 }
 
 // NewSupervisor wires the pieces together.
@@ -60,17 +79,18 @@ func NewSupervisor(cfg config.Config, api API, registry *Registry, syncer *Synce
 		logger:   logger,
 		rebuild:  make(chan []Spec, 1),
 	}
-	syncer.OnDevices(s.observeDevices)
+	syncer.OnPoll(s.observePoll)
 	return s
 }
 
-// observeDevices is called with the device list of every successful poll.
+// observePoll is called with the result of every successful poll.
 //
 // A failed poll never reaches here, which is the point: the accessory set can
 // only ever change on the strength of evidence that Yandex actually answered.
-func (s *Supervisor) observeDevices(devices []yandex.Device) {
-	specs := BuildSpecs(devices, s.cfg)
+func (s *Supervisor) observePoll(info *yandex.UserInfo) {
+	specs, reports := BuildSpecs(info, s.cfg)
 	hash := TopologyHash(specs)
+	s.setInventory(reports)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -104,6 +124,10 @@ func (s *Supervisor) observeDevices(devices []yandex.Device) {
 	s.logger.Info("device topology change confirmed, rebuilding accessories",
 		slog.String("topology", hash),
 		slog.Int("devices", len(specs)))
+
+	// Re-print the inventory: the device set just changed, so this is exactly
+	// when the operator needs to see ids and what got mapped.
+	LogInventory(s.logger, reports)
 
 	// Replace any queued rebuild: the newest confirmed set is the one to use.
 	select {
@@ -176,12 +200,14 @@ func (s *Supervisor) serve(ctx context.Context, specs []Spec) (<-chan error, fun
 	})
 	bridgeAcc.Id = BridgeAID
 
-	// A fresh health accessory each time: hap attaches callbacks to every
-	// characteristic it is handed, so reusing one would multiply notifications.
-	s.health.Rebuild()
-
 	others := make([]*accessory.A, 0, len(accessories)+1)
-	others = append(others, s.health.A)
+	if s.cfg.Health.Enabled {
+		// A fresh health accessory each time: hap attaches callbacks to every
+		// characteristic it is handed, so reusing one would multiply
+		// notifications.
+		s.health.Rebuild()
+		others = append(others, s.health.A)
+	}
 	for _, a := range accessories {
 		others = append(others, a.A)
 	}
@@ -226,6 +252,11 @@ func (s *Supervisor) build(specs []Spec) ([]*Accessory, error) {
 		return nil, fmt.Errorf("assign accessory ids: %w", err)
 	}
 
+	opts := BuildOptions{
+		CoalesceDelay: s.cfg.CoalesceDelay.Std(),
+		SettleWindow:  s.cfg.SettleWindow.Std(),
+	}
+
 	out := make([]*Accessory, 0, len(specs))
 	for _, spec := range specs {
 		aid, ok := aids[spec.DeviceID]
@@ -234,7 +265,7 @@ func (s *Supervisor) build(specs []Spec) ([]*Accessory, error) {
 				slog.String("device_id", spec.DeviceID))
 			continue
 		}
-		out = append(out, BuildAccessory(spec, aid, s.syncer, s.logger))
+		out = append(out, BuildAccessory(spec, aid, s.syncer, opts, s.logger))
 	}
 
 	// Order by aid so the list handed to hap is deterministic. The ids are
@@ -254,16 +285,12 @@ func (s *Supervisor) initialSpecs(ctx context.Context) ([]Spec, error) {
 	for attempt := 1; ; attempt++ {
 		info, err := s.api.UserInfo(ctx)
 		if err == nil {
-			specs := BuildSpecs(info.Devices, s.cfg)
-			s.logger.Info("loaded devices from Yandex",
-				slog.Int("total", len(info.Devices)),
-				slog.Int("exported", len(specs)))
-			for _, spec := range specs {
-				s.logger.Debug("exporting device",
-					slog.String("device_id", spec.DeviceID),
-					slog.String("name", spec.Name),
-					slog.String("kind", string(spec.Kind)))
-			}
+			specs, reports := BuildSpecs(info, s.cfg)
+			// The full inventory goes out at startup so the device ids and the
+			// mapping decisions needed to write config.yaml are on hand
+			// without turning on debug logging.
+			LogInventory(s.logger, reports)
+			s.setInventory(reports)
 			return specs, nil
 		}
 
