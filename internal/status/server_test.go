@@ -233,6 +233,33 @@ func TestResponsesAreDeclaredUTF8(t *testing.T) {
 	}
 }
 
+func TestDevicesEndpointCountsExported(t *testing.T) {
+	s := newServerWithInventory([]bridge.MappingReport{
+		{DeviceID: "lamp", Name: "Люстра", Kind: bridge.KindLightbulb},
+		{DeviceID: "kettle", Name: "Чайник", Kind: bridge.KindThermostat},
+		{DeviceID: "speaker", Name: "Дед Максим", Skipped: true, Reason: "unsupported"},
+		{DeviceID: "button", Name: "Кнопка", Skipped: true, Reason: "no on_off"},
+	})
+
+	rec := httptest.NewRecorder()
+	s.handleDevices(rec, httptest.NewRequest(http.MethodGet, "/devices", nil))
+
+	var body struct {
+		Count    int `json:"count"`
+		Exported int `json:"exported"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Count != 4 {
+		t.Errorf("count = %d, want 4", body.Count)
+	}
+	// Skipped devices are listed but do not count as exported.
+	if body.Exported != 2 {
+		t.Errorf("exported = %d, want 2", body.Exported)
+	}
+}
+
 func TestDevicesEndpointBeforeFirstPoll(t *testing.T) {
 	s := newServerWithInventory(nil)
 

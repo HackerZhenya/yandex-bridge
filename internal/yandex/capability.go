@@ -97,6 +97,24 @@ func (c Capability) OnOffState() (bool, error) {
 	return s.Value, nil
 }
 
+// Instance reads the "instance" field common to every capability's
+// parameters, whatever its type. Yandex adds undocumented capability types of
+// its own — identify and zigbee_node turn up on Zigbee devices — and knowing
+// the instance is the difference between reporting "some capability" and
+// something a human can act on.
+func (c Capability) Instance() string {
+	if rawOrNull(c.Parameters) {
+		return ""
+	}
+	var p struct {
+		Instance string `json:"instance"`
+	}
+	if err := json.Unmarshal(c.Parameters, &p); err != nil {
+		return ""
+	}
+	return p.Instance
+}
+
 // ToggleInstance decodes which two-state function a toggle capability
 // controls: backlight, keep_warm, ionization and so on.
 func (c Capability) ToggleInstance() (string, error) {
@@ -289,6 +307,17 @@ func (c Capability) ColorState() (ColorState, error) {
 	return out, nil
 }
 
+// Event property instances.
+const (
+	EventButton    = "button"
+	EventMotion    = "motion"
+	EventOpen      = "open"
+	EventVibration = "vibration"
+	EventSmoke     = "smoke"
+	EventGas       = "gas"
+	EventWaterLeak = "water_leak"
+)
+
 // Property is a read-only device reading.
 type Property struct {
 	Type        PropertyType    `json:"type"`
@@ -297,6 +326,21 @@ type Property struct {
 	Parameters  json.RawMessage `json:"parameters"`
 	State       json.RawMessage `json:"state"`
 	LastUpdated float64         `json:"last_updated"`
+}
+
+// Instance reads the "instance" field from a property's parameters, whatever
+// its type. Used to describe properties the bridge does not map.
+func (p Property) Instance() string {
+	if rawOrNull(p.Parameters) {
+		return ""
+	}
+	var params struct {
+		Instance string `json:"instance"`
+	}
+	if err := json.Unmarshal(p.Parameters, &params); err != nil {
+		return ""
+	}
+	return params.Instance
 }
 
 // FloatParams are the parameters of a float property.

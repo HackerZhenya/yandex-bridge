@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -17,9 +18,22 @@ func tempRegistry(t *testing.T) (*Registry, string) {
 	return r, path
 }
 
+// assign allocates aids for devices that all have the same accessory shape.
 func assign(t *testing.T, r *Registry, ids ...string) map[string]uint64 {
 	t.Helper()
-	got, err := r.Assign(ids)
+	return assignShaped(t, r, KindSwitch, ids...)
+}
+
+// assignShaped allocates aids for devices of a given shape, so a test can
+// change one device's shape and watch what happens to its aid.
+func assignShaped(t *testing.T, r *Registry, kind Kind, ids ...string) map[string]uint64 {
+	t.Helper()
+
+	specs := make([]Spec, 0, len(ids))
+	for _, id := range ids {
+		specs = append(specs, Spec{DeviceID: id, Kind: kind, HasOnOff: true})
+	}
+	got, err := r.Assign(specs)
 	if err != nil {
 		t.Fatalf("Assign(%v): %v", ids, err)
 	}
@@ -180,6 +194,107 @@ func TestAssignIsDeterministicRegardlessOfInputOrder(t *testing.T) {
 		if b[id] != aid {
 			t.Errorf("device %q got aid %d in one order and %d in another", id, aid, b[id])
 		}
+	}
+}
+
+// TestReshapedDeviceGetsANewAID covers the other half of the aid story. Stable
+// ids stop accessories being renumbered by accident; but when a device's
+// services genuinely change — a kettle that became a thermostat — HomeKit keeps
+// showing the cached layout for the old aid indefinitely. Retiring the aid is
+// the only transition it reliably understands.
+func TestReshapedDeviceGetsANewAID(t *testing.T) {
+	r, _ := tempRegistry(t)
+	before := assignShaped(t, r, KindSwitch, "kettle", "lamp")
+
+	after := assignShaped(t, r, KindThermostat, "kettle")
+	if after["kettle"] == before["kettle"] {
+		t.Errorf("aid stayed %d after the accessory changed shape", after["kettle"])
+	}
+
+	// And the untouched device keeps its number.
+	steady := assignShaped(t, r, KindSwitch, "lamp")
+	if steady["lamp"] != before["lamp"] {
+		t.Errorf("lamp aid changed from %d to %d although its shape did not",
+			before["lamp"], steady["lamp"])
+	}
+}
+
+func TestUnchangedShapeKeepsItsAID(t *testing.T) {
+	r, path := tempRegistry(t)
+	before := assignShaped(t, r, KindThermostat, "kettle")
+
+	reopened, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	after := assignShaped(t, reopened, KindThermostat, "kettle")
+
+	if after["kettle"] != before["kettle"] {
+		t.Errorf("aid changed from %d to %d across a restart with the same shape",
+			before["kettle"], after["kettle"])
+	}
+}
+
+func TestReshapedAIDIsNotReused(t *testing.T) {
+	r, _ := tempRegistry(t)
+	before := assignShaped(t, r, KindSwitch, "kettle")
+	assignShaped(t, r, KindThermostat, "kettle")
+
+	// The retired number must not land on some other device, or HomeKit would
+	// hand the newcomer the kettle's room and automations.
+	other := assign(t, r, "newcomer")
+	if other["newcomer"] == before["kettle"] {
+		t.Errorf("retired aid %d was handed to another device", other["newcomer"])
+	}
+}
+
+// TestUpgradeFromV1DoesNotRenumber matters because the shape was not recorded
+// before this feature existed: treating "unknown" as "changed" would renumber
+// every accessory in the house on the first restart after an upgrade.
+func TestUpgradeFromV1DoesNotRenumber(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aids.json")
+	v1 := `{"version":1,"next":5,"assigned":{"lamp":3,"kettle":4}}`
+	if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	r, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	got := assignShaped(t, r, KindThermostat, "lamp", "kettle")
+
+	if got["lamp"] != 3 || got["kettle"] != 4 {
+		t.Errorf("aids = %v, want the stored 3 and 4 kept as-is", got)
+	}
+
+	// The shape is adopted, so the *next* genuine change is detected.
+	reshaped := assignShaped(t, r, KindLightbulb, "lamp")
+	if reshaped["lamp"] == 3 {
+		t.Error("a shape change after the upgrade was not detected")
+	}
+}
+
+func TestRegistryWritesVersion2(t *testing.T) {
+	r, path := tempRegistry(t)
+	assignShaped(t, r, KindThermostat, "kettle")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var f struct {
+		Version  int                       `json:"version"`
+		Assigned map[string]map[string]any `json:"assigned"`
+	}
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.Version != 2 {
+		t.Errorf("version = %d, want 2", f.Version)
+	}
+	if f.Assigned["kettle"]["shape"] == nil {
+		t.Error("the entry carries no shape, so a change could never be detected")
 	}
 }
 

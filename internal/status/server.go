@@ -139,10 +139,20 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		reports = s.inventory.Inventory()
 	}
 
+	exported := 0
+	for _, r := range reports {
+		if !r.Skipped {
+			exported++
+		}
+	}
+
 	body := struct {
-		Count   int                    `json:"count"`
-		Devices []bridge.MappingReport `json:"devices"`
-	}{Count: len(reports), Devices: reports}
+		Count int `json:"count"`
+		// Exported is how many of them reached HomeKit. Seeing 9 devices and 7
+		// exported is the cue to read the skipped ones' reasons.
+		Exported int                    `json:"exported"`
+		Devices  []bridge.MappingReport `json:"devices"`
+	}{Count: len(reports), Exported: exported, Devices: reports}
 
 	// Device and room names are Cyrillic. JSON is UTF-8 by definition, but a
 	// client left to guess may fall back to the system codepage and render

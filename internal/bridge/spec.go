@@ -171,6 +171,9 @@ func BuildSpec(dev yandex.Device, o config.DeviceOverride, exposeToggles bool) (
 	if o.Exclude {
 		report.Skipped = true
 		report.Reason = "excluded in config"
+		// Still describe it: knowing what an excluded device offers is how you
+		// decide whether to un-exclude it.
+		_, report.Unmapped = describeMapping(dev, Spec{})
 		return Spec{}, report, false
 	}
 
@@ -194,6 +197,9 @@ func BuildSpec(dev yandex.Device, o config.DeviceOverride, exposeToggles bool) (
 	if !ok {
 		report.Skipped = true
 		report.Reason = skipReason(dev)
+		// Everything the device offers is, by definition, unmapped. Listing it
+		// is the only way to tell whether the device is worth supporting.
+		_, report.Unmapped = describeMapping(dev, Spec{})
 		return Spec{}, report, false
 	}
 	spec.Kind = kind
@@ -216,60 +222,69 @@ func BuildSpec(dev yandex.Device, o config.DeviceOverride, exposeToggles bool) (
 }
 
 // kindFor picks the HomeKit shape, honouring an explicit override first.
+//
+// Every switchable shape requires an on_off capability. Yandex types a device
+// by what it is, not by what it can do: a Zigbee wall button reports as
+// devices.types.switch but has no on_off at all, and exporting it as a HomeKit
+// Switch produced a toggle that controlled nothing and never updated.
 func kindFor(dev yandex.Device, o config.DeviceOverride) (Kind, bool) {
 	hasOnOff := dev.HasCapability(yandex.CapabilityOnOff)
 	hasTarget := targetTemperatureFor(dev) != nil
+	hasSensors := len(sensorsFor(dev, KindSensor)) > 0
 
-	switch o.Type {
-	case config.TypeLightbulb:
-		return KindLightbulb, true
-	case config.TypeOutlet:
-		return KindOutlet, true
-	case config.TypeSwitch:
-		return KindSwitch, true
-	case config.TypeFan:
-		// A dumb fan plugged into a smart socket: HomeKit gets a Fan with a
-		// single on/off control.
-		return KindFan, true
-	case config.TypeThermostat:
-		if hasOnOff && hasTarget {
-			return KindThermostat, true
+	if o.Type != config.TypeAuto {
+		if kind, ok := overrideKind(o.Type, hasOnOff, hasTarget); ok {
+			return kind, true
 		}
-		// Thermostat requires a target temperature characteristic; without a
-		// range to drive it the accessory would show a dial that does nothing.
-		return KindSwitch, hasOnOff
+		// The override cannot be honoured — usually a device with no on_off.
+		// Fall through rather than publish a control backed by nothing.
 	}
 
-	// Automatic.
 	if hasOnOff && hasTarget && heatsToTemperature(dev.Type) {
 		return KindThermostat, true
 	}
 
-	switch dev.Type.Base() {
-	case yandex.DeviceTypeLight:
-		return KindLightbulb, true
-	case yandex.DeviceTypeSocket:
-		return KindOutlet, true
-	case yandex.DeviceTypeSwitch:
-		return KindSwitch, true
-	case yandex.DeviceTypeSensor:
-		if len(sensorsFor(dev, KindSensor)) > 0 {
-			return KindSensor, true
+	if hasOnOff {
+		switch dev.Type.Base() {
+		case yandex.DeviceTypeLight:
+			return KindLightbulb, true
+		case yandex.DeviceTypeSocket:
+			return KindOutlet, true
+		case yandex.DeviceTypeSwitch:
+			return KindSwitch, true
 		}
-		// A sensor whose readings the bridge cannot map is not worth an
-		// empty accessory in the Home app.
-		return "", false
+		// An unrecognised type that can still be switched is exported as a
+		// plain switch; guessing anything richer would misrepresent it.
+		return KindSwitch, true
 	}
 
-	// An unrecognised type that can still be switched is exported as a plain
-	// switch; guessing anything richer would misrepresent the device.
-	if hasOnOff {
-		return KindSwitch, true
-	}
-	if len(sensorsFor(dev, KindSensor)) > 0 {
+	if hasSensors {
 		return KindSensor, true
 	}
 	return "", false
+}
+
+// overrideKind resolves an explicit type from the config, reporting false when
+// the device cannot back it.
+func overrideKind(t config.HomeKitType, hasOnOff, hasTarget bool) (Kind, bool) {
+	switch t {
+	case config.TypeLightbulb:
+		return KindLightbulb, hasOnOff
+	case config.TypeOutlet:
+		return KindOutlet, hasOnOff
+	case config.TypeSwitch:
+		return KindSwitch, hasOnOff
+	case config.TypeFan:
+		// A dumb fan plugged into a smart socket: HomeKit gets a Fan with a
+		// single on/off control.
+		return KindFan, hasOnOff
+	case config.TypeThermostat:
+		// Thermostat requires a target temperature characteristic; without a
+		// range to drive it the accessory would show a dial that does nothing.
+		return KindThermostat, hasOnOff && hasTarget
+	default:
+		return "", false
+	}
 }
 
 // heatsToTemperature reports whether a device type is unambiguously something
@@ -292,10 +307,32 @@ func heatsToTemperature(t yandex.DeviceType) bool {
 
 // skipReason explains why a device was not exported, for the inventory report.
 func skipReason(dev yandex.Device) string {
+	if hasButtonEvent(dev) {
+		// Worth calling out: it looks switchable in the Yandex app but is an
+		// input, and HomeKit models those as a different accessory type.
+		return fmt.Sprintf("device type %s is a button (event:button) with no on_off; "+
+			"HomeKit needs a stateless programmable switch for this, which the bridge does not build yet", dev.Type)
+	}
+	if !dev.HasCapability(yandex.CapabilityOnOff) && len(dev.Capabilities) > 0 {
+		return fmt.Sprintf("device type %s has no on_off capability and no readings this bridge maps", dev.Type)
+	}
 	if len(dev.Capabilities) == 0 && len(dev.Properties) == 0 {
 		return fmt.Sprintf("device type %s has no capabilities or properties", dev.Type)
 	}
 	return fmt.Sprintf("device type %s has nothing this bridge can map", dev.Type)
+}
+
+// hasButtonEvent reports whether the device is a physical button.
+func hasButtonEvent(dev yandex.Device) bool {
+	for _, p := range dev.Properties {
+		if p.Type != yandex.PropertyEvent {
+			continue
+		}
+		if p.Instance() == yandex.EventButton {
+			return true
+		}
+	}
+	return false
 }
 
 // brightnessFor extracts the brightness range, if the device has one.
@@ -478,13 +515,16 @@ func describeMapping(dev yandex.Device, spec Spec) (mapped, unmapped []string) {
 			note(exposed, "toggle:"+instance+" → Switch")
 
 		default:
-			unmapped = append(unmapped, string(c.Type))
+			// Includes capability types Yandex does not document — identify
+			// and zigbee_node show up on Zigbee devices. The instance is what
+			// makes the entry actionable rather than just a name.
+			unmapped = append(unmapped, withInstance(string(c.Type), c.Instance()))
 		}
 	}
 
 	for _, p := range dev.Properties {
 		if p.Type != yandex.PropertyFloat {
-			unmapped = append(unmapped, string(p.Type))
+			unmapped = append(unmapped, withInstance(string(p.Type), p.Instance()))
 			continue
 		}
 		params, err := p.FloatParameters()
@@ -509,6 +549,14 @@ func describeMapping(dev yandex.Device, spec Spec) (mapped, unmapped []string) {
 	}
 
 	return mapped, unmapped
+}
+
+// withInstance appends an instance to a type name when there is one.
+func withInstance(typ, instance string) string {
+	if instance == "" {
+		return typ
+	}
+	return typ + ":" + instance
 }
 
 // BuildSpecs maps a whole smart home, skipping anything unsupported.

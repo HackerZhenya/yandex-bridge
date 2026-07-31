@@ -195,7 +195,7 @@ func (s *Supervisor) serve(ctx context.Context, specs []Spec) (<-chan error, fun
 		Name:         s.cfg.HomeKit.Name,
 		Manufacturer: manufacturer,
 		Model:        "yandex-bridge",
-		SerialNumber: "yandex-bridge-1",
+		SerialNumber: "yandex-bridge",
 		Firmware:     Version,
 	})
 	bridgeAcc.Id = BridgeAID
@@ -242,14 +242,26 @@ func (s *Supervisor) serve(ctx context.Context, specs []Spec) (<-chan error, fun
 
 // build turns specs into accessories with stable ids.
 func (s *Supervisor) build(specs []Spec) ([]*Accessory, error) {
-	ids := make([]string, 0, len(specs))
+	before := make(map[string]uint64, len(specs))
 	for _, spec := range specs {
-		ids = append(ids, spec.DeviceID)
+		if aid, ok := s.registry.Lookup(spec.DeviceID); ok {
+			before[spec.DeviceID] = aid
+		}
 	}
 
-	aids, err := s.registry.Assign(ids)
+	aids, err := s.registry.Assign(specs)
 	if err != nil {
 		return nil, fmt.Errorf("assign accessory ids: %w", err)
+	}
+
+	// A renumbering is a visible event for the user — the accessory is
+	// re-added in the Home app and loses its room — so it is never silent.
+	for _, deviceID := range s.registry.Reshaped(specs, before) {
+		s.logger.Warn("device changed shape and was given a new accessory id; "+
+			"it will reappear in the Home app as a new accessory",
+			slog.String("device_id", deviceID),
+			slog.Uint64("old_aid", before[deviceID]),
+			slog.Uint64("new_aid", aids[deviceID]))
 	}
 
 	opts := BuildOptions{

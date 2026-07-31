@@ -327,6 +327,88 @@ func TestMappingReportNamesWhatIsLost(t *testing.T) {
 	}
 }
 
+// buttonJSON is a Zigbee wall button as Yandex reports it: typed as a switch,
+// but with no on_off at all — only an identify capability and a button event.
+const buttonJSON = `{"id":"button","name":"Левая нижняя кнопка","type":"devices.types.switch",
+	"capabilities":[{"type":"devices.capabilities.identify","retrievable":false,
+	                 "parameters":{"instance":"identify"}}],
+	"properties":[{"type":"devices.properties.event","retrievable":false,
+	               "parameters":{"instance":"button","events":[{"value":"click"}]},
+	               "state":{"instance":"button","value":"click"}}]}`
+
+// TestButtonIsNotExportedAsADeadSwitch is a regression: Yandex types a button
+// as devices.types.switch, and mapping on device type alone produced a HomeKit
+// toggle with nothing behind it — it controlled nothing and never updated.
+func TestButtonIsNotExportedAsADeadSwitch(t *testing.T) {
+	spec, report, ok := buildSpec(t, buttonJSON, config.DeviceOverride{})
+	if ok {
+		t.Fatalf("a button with no on_off was exported as %q", spec.Kind)
+	}
+	// The reason has to name the cause, or the device just looks arbitrarily
+	// missing from the Home app.
+	if !strings.Contains(report.Reason, "button") {
+		t.Errorf("reason = %q, want it to identify the device as a button", report.Reason)
+	}
+}
+
+func TestOverrideCannotConjureASwitch(t *testing.T) {
+	// Forcing a type does not give the device an on_off capability, and a
+	// control backed by nothing is worse than no control.
+	_, _, ok := buildSpec(t, buttonJSON, config.DeviceOverride{Type: config.TypeSwitch})
+	if ok {
+		t.Error("a type override produced a switch on a device with no on_off")
+	}
+}
+
+// TestSkippedDeviceStillListsItsFeatures is what makes the inventory useful for
+// deciding whether a device is worth supporting.
+func TestSkippedDeviceStillListsItsFeatures(t *testing.T) {
+	_, report, ok := buildSpec(t, buttonJSON, config.DeviceOverride{})
+	if ok {
+		t.Fatal("BuildSpec exported the button")
+	}
+
+	joined := strings.Join(report.Unmapped, " ")
+	for _, want := range []string{"identify", "button"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("unmapped = %v, want it to mention %q", report.Unmapped, want)
+		}
+	}
+}
+
+// TestUndocumentedCapabilitiesCarryTheirInstance matters because Yandex adds
+// capability types it does not document — identify and zigbee_node appear on
+// Zigbee devices — and the type name alone is not enough to act on.
+func TestUndocumentedCapabilitiesCarryTheirInstance(t *testing.T) {
+	_, report, ok := buildSpec(t,
+		`{"id":"lamp","name":"Люстра","type":"devices.types.light","capabilities":[`+onOffCap+`,
+		  {"type":"devices.capabilities.identify","parameters":{"instance":"identify"}},
+		  {"type":"devices.capabilities.zigbee_node","parameters":{"instance":"node"}}]}`,
+		config.DeviceOverride{})
+	if !ok {
+		t.Fatal("BuildSpec returned false")
+	}
+
+	joined := strings.Join(report.Unmapped, " ")
+	if !strings.Contains(joined, "devices.capabilities.identify:identify") {
+		t.Errorf("unmapped = %v, want the instance alongside the type", report.Unmapped)
+	}
+	if !strings.Contains(joined, "zigbee_node:node") {
+		t.Errorf("unmapped = %v, want zigbee_node with its instance", report.Unmapped)
+	}
+}
+
+func TestExcludedDeviceStillListsItsFeatures(t *testing.T) {
+	_, report, _ := buildSpec(t,
+		`{"id":"d","name":"Розетка","type":"devices.types.socket","capabilities":[`+onOffCap+`]}`,
+		config.DeviceOverride{Exclude: true})
+
+	// Knowing what an excluded device offers is how you decide to un-exclude it.
+	if len(report.Unmapped) == 0 {
+		t.Error("an excluded device reported nothing about its capabilities")
+	}
+}
+
 func TestSkippedDeviceCarriesAReason(t *testing.T) {
 	_, report, ok := buildSpec(t,
 		`{"id":"d","name":"Пылесос","type":"devices.types.vacuum_cleaner"}`,
